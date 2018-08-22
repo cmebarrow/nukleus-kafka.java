@@ -695,8 +695,7 @@ public final class ClientStreamFactory implements StreamFactory
                 // Abort the connection to force the client to re-attach.
                 detach();
             }
-
-            if (endOffset > startOffset && requestOffset <= startOffset)
+            else if (endOffset > startOffset && requestOffset <= startOffset)
             {
                 this.fetchOffsets.put(partition, endOffset);
                 progressHandler.handle(partition, startOffset, endOffset);
