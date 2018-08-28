@@ -50,6 +50,20 @@ public class TopicMessageDispatcher implements MessageDispatcher, DecoderMessage
     }
 
     @Override
+    public void adjustOffset(
+        int partition,
+        long oldOffset,
+        long newOffset)
+    {
+        broadcast.adjustOffset(partition, oldOffset, newOffset);
+        for (int i=0; i < keys.length; i++)
+        {
+            keys[i].adjustOffset(partition, oldOffset, newOffset);
+        }
+        headers.adjustOffset(partition, oldOffset, newOffset);
+    }
+
+    @Override
     public void detach()
     {
         broadcast.detach();
@@ -74,16 +88,19 @@ public class TopicMessageDispatcher implements MessageDispatcher, DecoderMessage
     {
         int result = dispatch(partition, requestOffset, messageOffset, key, headers.headerSupplier(), timestamp,
                 traceId, value);
+
         if (messageOffset + 1 == highWatermark)
         {
-            // Caught up to live stream, enable proactive message caching
+            // Caught up to live stream, enable pro-active message caching
             cacheNewMessages[partition] = true;
         }
+
         if (MessageDispatcher.matched(result))
         {
             indexes[partition].add(requestOffset, messageOffset, timestamp, traceId, key, headers, value,
                     cacheNewMessages[partition]);
         }
+
         return result;
     }
 

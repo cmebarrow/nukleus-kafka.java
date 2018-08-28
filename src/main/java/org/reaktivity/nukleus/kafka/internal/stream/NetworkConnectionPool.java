@@ -22,11 +22,13 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Collections.emptyIterator;
 import static org.reaktivity.nukleus.buffer.BufferPool.NO_SLOT;
 import static org.reaktivity.nukleus.kafka.internal.stream.KafkaError.NONE;
+import static org.reaktivity.nukleus.kafka.internal.stream.KafkaError.UNEXPECTED_SERVER_ERROR;
 import static org.reaktivity.nukleus.kafka.internal.stream.KafkaError.asKafkaError;
 import static org.reaktivity.nukleus.kafka.internal.util.BufferUtil.EMPTY_BYTE_ARRAY;
 
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Collections;
 import java.util.HashMap;
@@ -45,6 +47,7 @@ import java.util.function.Function;
 import java.util.function.IntConsumer;
 import java.util.function.IntSupplier;
 import java.util.function.IntToLongFunction;
+import java.util.function.LongSupplier;
 
 import org.agrona.BitUtil;
 import org.agrona.DirectBuffer;
@@ -54,9 +57,11 @@ import org.agrona.collections.Int2ObjectHashMap;
 import org.agrona.collections.IntArrayList;
 import org.agrona.collections.Long2LongHashMap;
 import org.agrona.collections.Long2LongHashMap.LongIterator;
+import org.agrona.collections.LongArrayList;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.reaktivity.nukleus.buffer.BufferPool;
 import org.reaktivity.nukleus.function.MessageConsumer;
+import org.reaktivity.nukleus.kafka.internal.KafkaNukleusFactorySpi;
 import org.reaktivity.nukleus.kafka.internal.cache.CompactedPartitionIndex;
 import org.reaktivity.nukleus.kafka.internal.cache.DefaultPartitionIndex;
 import org.reaktivity.nukleus.kafka.internal.cache.MessageCache;
@@ -117,6 +122,8 @@ public final class NetworkConnectionPool
     private static final short DESCRIBE_CONFIGS_API_VERSION = 0;
     private static final short DESCRIBE_CONFIGS_API_KEY = 32;
 
+    private static final long MAX_OFFSET = Long.MAX_VALUE;
+
     private static final byte RESOURCE_TYPE_TOPIC = 2;
     private static final String CLEANUP_POLICY = "cleanup.policy";
     private static final String DELETE_RETENTION_MS = "delete.retention.ms";
@@ -128,6 +135,8 @@ public final class NetworkConnectionPool
 
     private static final int KAFKA_SERVER_DEFAULT_DELETE_RETENTION_MS = 86400000;
     private static final PartitionIndex DEFAULT_PARTITION_INDEX = new DefaultPartitionIndex();
+
+    private static final LongSupplier NO_COUNTER = Long.valueOf(0L)::longValue;
 
     private static final DecoderMessageDispatcher NOOP_DISPATCHER = new DecoderMessageDispatcher()
     {
@@ -153,15 +162,21 @@ public final class NetworkConnectionPool
             long lastOffset)
         {
         }
+
     };
 
     private static final MessageDispatcher MATCHING_MESSAGE_DISPATCHER = new MessageDispatcher()
     {
+        @Override
+        public void adjustOffset(int partition, long oldOffset, long newOffset)
+        {
+
+        }
 
         @Override
         public void detach()
         {
-        };
+        }
 
         @Override
         public int dispatch(
@@ -175,7 +190,7 @@ public final class NetworkConnectionPool
             DirectBuffer value)
         {
             return MessageDispatcher.FLAGS_MATCHED;
-        };
+        }
 
         @Override
         public void flush(
@@ -183,7 +198,7 @@ public final class NetworkConnectionPool
             long requestOffset,
             long lastOffset)
         {
-        };
+        }
     };
 
     enum MetadataRequestType
@@ -253,6 +268,9 @@ public final class NetworkConnectionPool
     private final Map<String, List<ListFW<KafkaHeaderFW>>> routeHeadersByTopic;
     private final Int2ObjectHashMap<Consumer<Long2LongHashMap>> detachersById;
 
+    private final List<NetworkTopicPartition> partitionsWorkList = new ArrayList<NetworkTopicPartition>();
+    private final LongArrayList offsetsWorkList = new LongArrayList();
+    private final LongSupplier historicalFetches;
     private int nextAttachId;
 
     NetworkConnectionPool(
@@ -263,6 +281,7 @@ public final class NetworkConnectionPool
         int fetchPartitionMaxBytes,
         BufferPool bufferPool,
         MessageCache messageCache,
+        Function<String, LongSupplier> supplyCounter,
         boolean forceProactiveMessageCache)
     {
         this.clientStreamFactory = clientStreamFactory;
@@ -273,6 +292,8 @@ public final class NetworkConnectionPool
         this.bufferPool = bufferPool;
         this.messageCache = messageCache;
         this.forceProactiveMessageCache = forceProactiveMessageCache;
+        this.historicalFetches = supplyCounter.apply(
+                format("%s.%s.%d", KafkaNukleusFactorySpi.HISTORICAL_FETCHES, networkName, networkRef));
         this.encodeBuffer = new UnsafeBuffer(new byte[clientStreamFactory.bufferPool.slotCapacity()]);
         this.topicsByName = new LinkedHashMap<>();
         this.topicMetadataByName = new HashMap<>();
@@ -325,10 +346,13 @@ public final class NetworkConnectionPool
             onMetadataError.accept(errorCode);
             break;
         case NONE:
+            // For streaming topics default to receiving only live (new) messages
+            final long defaultOffset = fetchOffsets.isEmpty() && !topicMetadata.compacted ? MAX_OFFSET : 0L;
+
             if (fetchKey != null)
             {
                 int partitionId = BufferUtil.partition(partitionHash, topicMetadata.partitionCount());
-                long offset = fetchOffsets.computeIfAbsent(0L, v -> 0L);
+                long offset = fetchOffsets.computeIfAbsent(0L, v -> defaultOffset);
                 long lowestOffset = topicMetadata.firstAvailableOffset(partitionId);
                 offset = Math.max(offset,  lowestOffset);
                 if (partitionId != 0)
@@ -342,7 +366,7 @@ public final class NetworkConnectionPool
                 final int partitionCount = topicMetadata.partitionCount();
                 for (int partition=0; partition < partitionCount; partition++)
                 {
-                    long offset = fetchOffsets.computeIfAbsent(partition, v -> 0L);
+                    long offset = fetchOffsets.computeIfAbsent(partition, v -> defaultOffset);
                     long lowestOffset = topicMetadata.firstAvailableOffset(partition);
                     offset = Math.max(offset,  lowestOffset);
                     fetchOffsets.put(partition, offset);
@@ -533,7 +557,9 @@ public final class NetworkConnectionPool
         @Override
         public String toString()
         {
-            return String.format("[budget=%d, padding=%d]", networkRequestBudget, networkRequestPadding);
+            return format("%s [budget=%d, padding=%d, networkId=%d, networkReplyId=%d, nextRequestId %d, nextResponseId %d]",
+                    getClass().getSimpleName(), networkRequestBudget, networkRequestPadding,
+                    networkId, networkReplyId, nextRequestId, nextResponseId);
         }
 
         MessageConsumer onCorrelated(
@@ -889,6 +915,7 @@ public final class NetworkConnectionPool
     abstract class AbstractFetchConnection extends AbstractNetworkConnection
     {
         private static final long EARLIEST_AVAILABLE_OFFSET = -2L;
+        private static final long NEXT_OFFSET = -1L; // high water mark (offset of the next published message)
 
         final String host;
         final int port;
@@ -900,12 +927,17 @@ public final class NetworkConnectionPool
         Map<String, long[]> requestedFetchOffsetsByTopic = new HashMap<>();
         final ResponseDecoder fetchResponseDecoder;
 
-        private AbstractFetchConnection(BrokerMetadata broker)
+        private final LongSupplier fetches;
+
+        private AbstractFetchConnection(
+            BrokerMetadata broker,
+            LongSupplier fetches)
         {
             super();
             this.brokerId = broker.nodeId;
             this.host = broker.host;
             this.port = broker.port;
+            this.fetches = fetches;
             fetchResponseDecoder = new FetchResponseDecoder(
                     this::getTopicDispatcher,
                     this::getRequestedOffset,
@@ -938,6 +970,11 @@ public final class NetworkConnectionPool
                     else
                     {
                         doFetchRequest();
+                        if (offsetsNeeded)
+                        {
+                            // Make sure we continue if no fetch request was done because all needed high water mark offset
+                            doRequestIfNeeded();
+                        }
                     }
                 }
             }
@@ -1031,6 +1068,8 @@ public final class NetworkConnectionPool
                     .set((b, o, m) -> m - o)
                     .build();
 
+                fetches.getAsLong();
+
                 NetworkConnectionPool.this.clientStreamFactory.doData(networkTarget, networkId,
                         networkRequestPadding, payload);
                 networkRequestBudget -= payload.sizeof() + networkRequestPadding;
@@ -1087,11 +1126,14 @@ public final class NetworkConnectionPool
                         {
                             if (topicMetadata.nodeIdsByPartition[partitionId] == brokerId)
                             {
+                                long requestedTimestamp = topicMetadata.offsetsOutOfRangeByPartition[partitionId] == MAX_OFFSET
+                                        ? NEXT_OFFSET
+                                        : EARLIEST_AVAILABLE_OFFSET;
                                 ListOffsetsPartitionRequestFW listOffsetsPartitionRequest = listOffsetsPartitionRequestRW.wrap(
                                         NetworkConnectionPool.this.encodeBuffer, encodeLimit,
                                         NetworkConnectionPool.this.encodeBuffer.capacity())
                                         .partitionId(partitionId)
-                                        .timestamp(EARLIEST_AVAILABLE_OFFSET)
+                                        .timestamp(requestedTimestamp)
                                         .build();
 
                                 encodeLimit = listOffsetsPartitionRequest.limit();
@@ -1193,7 +1235,8 @@ public final class NetworkConnectionPool
                 final ListOffsetsTopicFW topic =
                         listOffsetsTopicRO.wrap(networkBuffer, networkOffset, networkLimit);
                 final String16FW name = topic.name();
-                TopicMetadata topicMetadata = topicMetadataByName.get(name.asString());
+                String topicName = name.asString();
+                TopicMetadata topicMetadata = topicMetadataByName.get(topicName);
                 networkOffset = topic.limit();
 
                 final int partitionCount = topic.partitionCount();
@@ -1205,11 +1248,23 @@ public final class NetworkConnectionPool
                     errorCode = asKafkaError(partition.errorCode());
                     if (errorCode != NONE)
                     {
+                        handlePartitionResponseError(name.asString(), i, errorCode);
                         break;
                     }
                     final long offset = partition.firstOffset();
                     final int partitionId = partition.partitionId();
-                    topicMetadata.setFirstOffset(partitionId, offset);
+
+                    if (topicMetadata.offsetsOutOfRangeByPartition[partitionId] == MAX_OFFSET)
+                    {
+                        NetworkTopic networkTopic = topicsByName.get(topicName);
+                        networkTopic.dispatcher.adjustOffset(partitionId, MAX_OFFSET, offset);
+                        networkTopic.setLiveOffset(partitionId, offset);
+                    }
+                    else
+                    {
+                        topicMetadata.setFirstOffset(partitionId, offset);
+                    }
+
                     networkOffset = partition.limit();
                 }
             }
@@ -1241,7 +1296,7 @@ public final class NetworkConnectionPool
         {
             for (TopicMetadata metadata : topicMetadataByName.values())
             {
-                if (metadata.removeBroker(brokerId))
+                if (metadata.invalidateBroker(brokerId))
                 {
                     metadata.doAttach(this::metadataUpdated);
                 }
@@ -1272,9 +1327,10 @@ public final class NetworkConnectionPool
             case OFFSET_OUT_OF_RANGE:
                 offsetsNeeded = true;
                 TopicMetadata topicMetadata = topicMetadataByName.get(topicName);
+                long badOffset = getRequestedOffset(topicName, partition);
 
                 // logStartOffset is always -1 in this case so we can't use it
-                topicMetadata.setFirstOffset(partition, TopicMetadata.UNKNOWN_OFFSET);
+                topicMetadata.setOffsetOutOfRange(partition, badOffset);
 
                 break;
             case UNKNOWN_TOPIC_OR_PARTITION:
@@ -1293,8 +1349,10 @@ public final class NetworkConnectionPool
         @Override
         public String toString()
         {
-            return String.format("%s [brokerId=%d, host=%s, port=%d, budget=%d, padding=%d]",
-                    getClass().getName(), brokerId, host, port, networkRequestBudget, networkRequestPadding);
+            return format("%s [brokerId=%d, host=%s, port=%d, budget=%d, padding=%d, networkId=%d, networkReplyId=%d," +
+                          "nextRequestId=%d, nextResponseId=%d]",
+                    getClass().getSimpleName(), brokerId, host, port, networkRequestBudget, networkRequestPadding,
+                    networkId, networkReplyId, nextRequestId, nextResponseId);
         }
     }
 
@@ -1302,7 +1360,7 @@ public final class NetworkConnectionPool
     {
         LiveFetchConnection(BrokerMetadata broker)
         {
-            super(broker);
+            super(broker, NO_COUNTER);
         }
 
         @Override
@@ -1325,26 +1383,65 @@ public final class NetworkConnectionPool
                 Iterator<NetworkTopicPartition> iterator = topic.partitions.iterator();
                 NetworkTopicPartition candidate = iterator.hasNext() ? iterator.next() : null;
                 NetworkTopicPartition next;
-                while (candidate != null && nodeIdsByPartition != null)
+
+                while (candidate != null)
                 {
                     next = iterator.hasNext() ? iterator.next() : null;
                     boolean isHighestOffset = next == null || next.id != candidate.id;
+
                     if (isHighestOffset && nodeIdsByPartition[candidate.id] == brokerId)
                     {
-                        long offset = Math.max(candidate.offset,  metadata.firstAvailableOffset(candidate.id));
-                        PartitionRequestFW partitionRequest = NetworkConnectionPool.this.partitionRequestRW
-                            .wrap(NetworkConnectionPool.this.encodeBuffer, encodeLimit,
-                                    NetworkConnectionPool.this.encodeBuffer.capacity())
-                            .partitionId(candidate.id)
-                            .fetchOffset(offset)
-                            .maxBytes(maxPartitionBytes)
-                            .build();
+                        if (candidate.offset == MAX_OFFSET)
+                        {
+                            // Trigger list offsets request to get the high water mark offset
+                            offsetsNeeded = true;
+                            metadata.offsetsOutOfRangeByPartition[candidate.id] = MAX_OFFSET;
+                        }
+                        else
+                        {
+                            long offset = metadata.ensureOffsetInRange(candidate.id, candidate.offset);
+                            PartitionRequestFW partitionRequest = NetworkConnectionPool.this.partitionRequestRW
+                                    .wrap(NetworkConnectionPool.this.encodeBuffer, encodeLimit,
+                                            NetworkConnectionPool.this.encodeBuffer.capacity())
+                                    .partitionId(candidate.id).fetchOffset(offset).maxBytes(maxPartitionBytes).build();
 
-                        setRequestedOffset.accept(candidate.id,  candidate.offset);
-                        encodeLimit = partitionRequest.limit();
-                        partitionCount++;
+                            long requestedOffset = candidate.offset;
+
+                            if (offset < candidate.offset)
+                            {
+                                // Topic was recreated, we have to go back to an earlier offset
+                                topic.dispatcher.adjustOffset(candidate.id, candidate.offset, offset);
+                                requestedOffset = offset;
+
+                                // Prepare to update the partition offset later
+                                NetworkTopicPartition partition = candidate.clone();
+                                partitionsWorkList.add(partition);
+                                offsetsWorkList.addLong(offset);
+                            }
+
+                            setRequestedOffset.accept(candidate.id, requestedOffset);
+                            encodeLimit = partitionRequest.limit();
+                            partitionCount++;
+                        }
                     }
+
                     candidate = next;
+                }
+
+                if (!partitionsWorkList.isEmpty())
+                {
+                    // Update the partition offsets. We must remove and add to preserve ordering.
+                    for (int i=0; i < partitionsWorkList.size(); i++)
+                    {
+                        NetworkTopicPartition partition = partitionsWorkList.get(i);
+                        boolean removed = topic.partitions.remove(partition);
+                        assert removed;
+                        partition.offset = offsetsWorkList.getLong(i);
+                        topic.partitions.add(partition);
+                    }
+
+                    partitionsWorkList.clear();
+                    offsetsWorkList.clear();
                 }
             }
 
@@ -1362,7 +1459,7 @@ public final class NetworkConnectionPool
     {
         private HistoricalFetchConnection(BrokerMetadata broker)
         {
-            super(broker);
+            super(broker, historicalFetches);
         }
 
         @Override
@@ -1384,13 +1481,18 @@ public final class NetworkConnectionPool
                     final int[] nodeIdsByPartition = metadata.nodeIdsByPartition;
 
                     int partitionId = -1;
+
                     // TODO: eliminate iterator allocation
-                    for (NetworkTopicPartition partition : topic.partitions)
+                    Iterator<NetworkTopicPartition> partitions = topic.partitions.iterator();
+
+                    while (partitions.hasNext())
                     {
+                        NetworkTopicPartition partition = partitions.next();
+
                         if (topic.needsHistorical(partition.id) &&
                                 partitionId < partition.id && nodeIdsByPartition[partition.id] == brokerId)
                         {
-                            long offset = Math.max(partition.offset,  metadata.firstAvailableOffset(partition.id));
+                            long offset = metadata.ensureOffsetInRange(partition.id, partition.offset);
                             PartitionRequestFW partitionRequest = NetworkConnectionPool.this.partitionRequestRW
                                 .wrap(NetworkConnectionPool.this.encodeBuffer, encodeLimit,
                                         NetworkConnectionPool.this.encodeBuffer.capacity())
@@ -1399,19 +1501,36 @@ public final class NetworkConnectionPool
                                 .maxBytes(maxPartitionBytes)
                                 .build();
 
+                            if (offset < partition.offset)
+                            {
+                                // Topic was recreated, we have to go back to an earlier offset
+                                // We must remove and add the partition to preserve ordering
+                                topic.dispatcher.adjustOffset(partition.id, partition.offset, offset);
+                                partitions.remove();
+                                partition.offset = offset;
+                                partitionsWorkList.add(partition);
+                            }
                             setRequestedOffset.accept(partition.id,  partition.offset);
                             encodeLimit = partitionRequest.limit();
                             partitionId = partition.id;
                             partitionCount++;
                         }
                     }
+
+                    if (!partitionsWorkList.isEmpty())
+                    {
+                        topic.partitions.addAll(partitionsWorkList);
+                        partitionsWorkList.clear();
+                    }
+
                     partitionCount = topic.satisfyPartitionRequestsFromCache(
                             partitionCount,
                             getRequestedOffset,
+                            setRequestedOffset,
                             NetworkConnectionPool.this.encodeBuffer,
                             originalEncodeLimit,
                             encodeLimit,
-                            (l) -> encodeLimit = l);
+                            l -> encodeLimit = l);
                 }
 
             }
@@ -1661,18 +1780,28 @@ public final class NetworkConnectionPool
             }
             if (error.isRecoverable())
             {
-                pendingTopicMetadata.reset();
+                pendingTopicMetadata.invalidate();
                 doRequestIfNeeded();
+            }
+            else if (error == UNEXPECTED_SERVER_ERROR)
+            {
+                // internal Kafka error, trigger connection failed and reconnect
+                pendingTopicMetadata.invalidate();
+                abort();
             }
             else
             {
-                TopicMetadata metadata = pendingTopicMetadata;
-                pendingTopicMetadata = null;
-                metadata.setErrorCode(error);
-                metadata.setCompacted(compacted);
-                metadata.setDeleteRetentionMs(deleteRetentionMs);
-                metadata.setComplete(true);
-                metadata.flush();
+                // Guard against a possible race with invalidateBroker called due to fetch connection failure
+                if (pendingTopicMetadata.nextRequiredRequestType == MetadataRequestType.DESCRIBE_CONFIGS)
+                {
+                    TopicMetadata metadata = pendingTopicMetadata;
+                    pendingTopicMetadata = null;
+                    metadata.setErrorCode(error);
+                    metadata.setCompacted(compacted);
+                    metadata.setDeleteRetentionMs(deleteRetentionMs);
+                    metadata.setComplete(true);
+                    metadata.flush();
+                }
             }
         }
 
@@ -1705,7 +1834,7 @@ public final class NetworkConnectionPool
             {
                 final TopicMetadataFW topicMetadata =
                         NetworkConnectionPool.this.topicMetadataRO.wrap(networkBuffer, networkOffset, networkLimit);
-                final String16FW topicName = topicMetadata.topic();
+                String16FW topicName = topicMetadata.topic();
                 assert topicName.asString().equals(pendingTopicMetadata.topicName);
                 error = asKafkaError(topicMetadata.errorCode());
                 if (error != NONE)
@@ -1728,7 +1857,7 @@ public final class NetworkConnectionPool
                 }
                 else
                 {
-                    detachSubscribers(pendingTopicMetadata.topicName);
+                    error = KafkaError.PARTITION_COUNT_CHANGED;
                 }
             }
             final TopicMetadata topicMetadata = pendingTopicMetadata;
@@ -1738,12 +1867,12 @@ public final class NetworkConnectionPool
                 pendingTopicMetadata.nextRequiredRequestType = MetadataRequestType.DESCRIBE_CONFIGS;
                 break;
             case LEADER_NOT_AVAILABLE:
-                pendingTopicMetadata.reset();
+                pendingTopicMetadata.invalidate();
                 doRequestIfNeeded();
                 break;
             case UNEXPECTED_SERVER_ERROR:
                 // internal Kafka error, trigger connection failed and reconnect
-                pendingTopicMetadata.reset();
+                pendingTopicMetadata.invalidate();
                 abort();
                 break;
             default:
@@ -1786,12 +1915,14 @@ public final class NetworkConnectionPool
         private final PartitionProgressHandler progressHandler;
 
         private BitSet needsHistoricalByPartition = new BitSet();
+        private BitSet isLiveByPartition = new BitSet();
         private final boolean proactive;
 
         @Override
         public String toString()
         {
-            return String.format("topicName=%s, partitions=%s", topicName, partitions);
+            return format("topicName=%s, partitions=%s, needsHistoricalByPartition=%s, isLiveByPartition=%s",
+                    topicName, partitions, needsHistoricalByPartition, isLiveByPartition);
         }
 
         private NetworkTopic(
@@ -1810,6 +1941,7 @@ public final class NetworkConnectionPool
             this.candidate = new NetworkTopicPartition();
             this.progressHandler = this::handleProgress;
             PartitionIndex[] partitionIndexes = new PartitionIndex[partitionCount];
+
             if (compacted)
             {
                 for (int i = 0; i < partitionCount; i++)
@@ -1832,10 +1964,12 @@ public final class NetworkConnectionPool
 
             // Cache only messages matching route header conditions
             List<ListFW<KafkaHeaderFW>> routeHeadersList = routeHeadersByTopic.remove(topicName);
+
             if (routeHeadersList != null)
             {
                 routeHeadersList.forEach(this::addRoute);
             }
+
             if (proactive)
             {
                  for (int i=0; i < partitionCount; i++)
@@ -1874,10 +2008,11 @@ public final class NetworkConnectionPool
             IntSupplier supplyWindow)
         {
             windowSuppliers.add(supplyWindow);
-            int fetchKeyPartition;
+            headersIterator.wrap(headers);
+
             if (fetchKey == null)
             {
-                fetchKeyPartition = -1;
+                this.dispatcher.add(null, -1, headersIterator, dispatcher);
                 final LongIterator keys = fetchOffsets.keySet().iterator();
                 while (keys.hasNext())
                 {
@@ -1894,7 +2029,8 @@ public final class NetworkConnectionPool
             }
             else
             {
-                fetchKeyPartition = fetchOffsets.keySet().iterator().next().intValue();
+                int fetchKeyPartition = fetchOffsets.keySet().iterator().next().intValue();
+                this.dispatcher.add(fetchKey, fetchKeyPartition, headersIterator, dispatcher);
                 long fetchOffset = fetchOffsets.get(fetchKeyPartition);
                 if (compacted)
                 {
@@ -1908,8 +2044,6 @@ public final class NetworkConnectionPool
                 attachToPartition(fetchKeyPartition, fetchOffset, 1);
             }
 
-            headersIterator.wrap(headers);
-            this.dispatcher.add(fetchKey, fetchKeyPartition, headersIterator, dispatcher);
             return progressHandler;
         }
 
@@ -1921,9 +2055,19 @@ public final class NetworkConnectionPool
             candidate.id = partitionId;
             candidate.offset = fetchOffset;
             NetworkTopicPartition partition = partitions.floor(candidate);
+
+            if (fetchOffset == MAX_OFFSET &&
+                partition != null && partition.id == candidate.id && isLiveByPartition.get(partitionId))
+            {
+                // Attach to live stream
+                candidate.offset = partition.offset;
+                dispatcher.adjustOffset(partitionId, fetchOffset, partition.offset);
+            }
+
             if (!candidate.equals(partition))
             {
                 boolean needsHistorical;
+
                 if (partition != null && partition.id == candidate.id)
                 {
                     needsHistorical = true;
@@ -1933,13 +2077,19 @@ public final class NetworkConnectionPool
                     NetworkTopicPartition ceiling = partitions.ceiling(candidate);
                     needsHistorical = ceiling != null && ceiling.id == candidate.id;
                 }
+
                 needsHistoricalByPartition.set(candidate.id, needsHistorical);
                 partition = new NetworkTopicPartition();
                 partition.id = candidate.id;
                 partition.offset = candidate.offset;
+                add(partition);
 
-                partitions.add(partition);
+                if (fetchOffset == MAX_OFFSET)
+                {
+                    isLiveByPartition.set(partitionId);
+                }
             }
+
             partition.refs += refs;
         }
 
@@ -1976,14 +2126,26 @@ public final class NetworkConnectionPool
             candidate.id = partitionId;
             candidate.offset = fetchOffset;
             NetworkTopicPartition partition = partitions.floor(candidate);
-            if (partition != null)
+            if (partition == null || partition.id != candidate.id || partition.offset != candidate.offset)
             {
-                assert partition.id == candidate.id;
-                partition.refs--;
+                throw new IllegalStateException(
+                   format("floor gave %s, expected (id=%d, offset=%d); topic=%s",
+                           partition, partitionId, fetchOffset, this));
+            }
 
-                if (partition.refs == 0)
+            partition.refs--;
+            if (partition.refs == 0)
+            {
+                remove(partition);
+
+                if (isLiveByPartition.get(partitionId))
                 {
-                    remove(partition);
+                    // If we just removed the highest offset then we are no longer on live stream
+                    partition = partitions.floor(candidate);
+                    if (partition != null && partition.id == partitionId && partition.offset < fetchOffset)
+                    {
+                        isLiveByPartition.clear(partitionId);
+                    }
                 }
             }
         }
@@ -2009,6 +2171,7 @@ public final class NetworkConnectionPool
         int satisfyPartitionRequestsFromCache(
             final int partitionCount,
             IntToLongFunction getRequestedOffset,
+            IntLongConsumer setRequestedOffset,
             MutableDirectBuffer encodeBuffer,
             int encodeOffset,
             final int encodeLimit,
@@ -2026,9 +2189,10 @@ public final class NetworkConnectionPool
                 int maxBytes = request.maxBytes();
                 long newOffset = fetchOffset;
                 Iterator<Entry> entries = dispatcher.entries(partitionId, fetchOffset);
-                boolean requestSatisifed = true;
+                boolean partitionRequestNeeded = false;
                 boolean flushNeeded = false;
-                long requestOffset = getRequestedOffset.applyAsLong(partitionId);
+                final long requestOffset = getRequestedOffset.applyAsLong(partitionId);
+
                 while(entries.hasNext())
                 {
                     Entry entry = entries.next();
@@ -2036,7 +2200,7 @@ public final class NetworkConnectionPool
                     MessageFW message = messageCache.get(entry.message(), messageRO);
                     if (message == null)
                     {
-                        requestSatisifed = false;
+                        partitionRequestNeeded = true;
                         break;
                     }
                     else
@@ -2051,21 +2215,25 @@ public final class NetworkConnectionPool
                                 message.timestamp(), message.traceId(), value);
 
                         flushNeeded = true;
-                        if (!needsHistorical(partitionId) // caught up to live stream
-                            ||
-                            (MessageDispatcher.blocked(dispatched) &&
-                            !MessageDispatcher.delivered(dispatched)))
+                        newOffset++;
+
+                        if (MessageDispatcher.blocked(dispatched) && !MessageDispatcher.delivered(dispatched))
+                        {
                             // TODO: this may be too conservative, other dispatchers which did not match this message
                             //       might still have available window to deliver later messages
-                        {
-                            requestSatisifed = true;
                             break;
                         }
                     }
-                }
-                if (requestSatisifed)
+                } // end for each partition index entry
+
+                if (!partitionRequestNeeded)
                 {
-                    newOffset = dispatcher.nextOffset(partitionId);
+                    if (!entries.hasNext())
+                    {
+                        //  End of the partition index reached, advance to latest offset
+                        newOffset = dispatcher.nextOffset(partitionId);
+                    }
+
                     // Remove the partition request by shifting up the subsequent ones
                     encodeBuffer.putBytes(encodeOffset,  encodeBuffer, request.limit(), encodeLimit);
                     newEncodeLimit -= request.sizeof();
@@ -2073,7 +2241,7 @@ public final class NetworkConnectionPool
                 }
                 else
                 {
-                    // Update the partition request if needed and move on to next
+                    // Update the partition request if needed
                     if (newOffset > fetchOffset)
                     {
                         request = partitionRequestRW.wrap(encodeBuffer, encodeOffset, newEncodeLimit)
@@ -2085,16 +2253,21 @@ public final class NetworkConnectionPool
                     }
                     encodeOffset = request.limit();
                 }
-                if (flushNeeded)
+
+                if (flushNeeded || newOffset > fetchOffset)
                 {
                     dispatcher.flush(partitionId, requestOffset, newOffset);
+                    setRequestedOffset.accept(partitionId, newOffset);
                 }
-            }
+            } // end for each partition
+
             assert encodeLimit <= encodeLimit;
+
             if (newEncodeLimit < encodeLimit)
             {
                 setNewLimit.accept(newEncodeLimit);
             }
+
             return newPartitionCount;
         }
 
@@ -2106,8 +2279,14 @@ public final class NetworkConnectionPool
             candidate.id = partitionId;
             candidate.offset = firstOffset;
             NetworkTopicPartition first = partitions.floor(candidate);
-            assert first != null;
-            assert first.offset == firstOffset;
+
+            if (first == null || first.id != partitionId || first.offset != firstOffset)
+            {
+                throw new IllegalStateException(
+                        format("floor gave %s, expected (id=%d, offset=%d); nextOffset = %d, topic=%s",
+                                first, partitionId, firstOffset, nextOffset, this));
+            }
+
             first.refs--;
 
             candidate.offset = nextOffset;
@@ -2121,13 +2300,19 @@ public final class NetworkConnectionPool
                 next = new NetworkTopicPartition();
                 next.id = partitionId;
                 next.offset = nextOffset;
-                partitions.add(next);
+                add(next);
             }
             next.refs++;
             if (first.refs == 0)
             {
                 remove(first);
             }
+        }
+
+        private void add(
+            NetworkTopicPartition partition)
+        {
+            partitions.add(partition);
         }
 
         private void remove(
@@ -2137,12 +2322,13 @@ public final class NetworkConnectionPool
             boolean needsHistorical = false;
             partition.offset = 0;
             NetworkTopicPartition lowest = partitions.ceiling(partition);
+
             if (lowest != null && lowest.id == partition.id)
             {
                 partition.offset = Long.MAX_VALUE;
                 NetworkTopicPartition highest = partitions.floor(partition);
-                // TODO: BUG must add && highest.id == partition.id
-                if (highest != lowest)
+
+                if (highest != lowest && highest.id == partition.id)
                 {
                     needsHistorical = true;
                 }
@@ -2160,6 +2346,37 @@ public final class NetworkConnectionPool
             return needsHistoricalByPartition.get(partition);
         }
 
+        void setLiveOffset(
+            int partitionId,
+            long offset)
+        {
+            assert isLiveByPartition.get(partitionId);
+            candidate.id = partitionId;
+            candidate.offset = MAX_OFFSET;
+            NetworkTopicPartition maxOffset = partitions.floor(candidate);
+            assert maxOffset.id == partitionId;
+            assert maxOffset.offset == MAX_OFFSET;
+            partitions.remove(maxOffset);
+
+            NetworkTopicPartition existing = partitions.floor(candidate);
+
+            if (existing != null && existing.id == partitionId && existing.offset == offset)
+            {
+                NetworkTopicPartition floor = partitions.floor(existing);
+                if (floor.id == partitionId && floor.offset != offset)
+                {
+                    needsHistoricalByPartition.set(partitionId, true);
+                }
+            }
+            else
+            {
+                NetworkTopicPartition partition = maxOffset.clone();
+                partition.offset = offset;
+                partitions.add(partition);
+                needsHistoricalByPartition.set(partition.id, true);
+            }
+        }
+
         DirectBuffer wrap(MutableDirectBuffer wrapper, Flyweight wrapped)
         {
             DirectBuffer result = null;
@@ -2172,7 +2389,7 @@ public final class NetworkConnectionPool
         }
     }
 
-    private static final class NetworkTopicPartition implements Comparable<NetworkTopicPartition>
+    static final class NetworkTopicPartition implements Comparable<NetworkTopicPartition>
     {
         private static final NetworkTopicPartition NONE = new NetworkTopicPartition();
         static
@@ -2185,22 +2402,39 @@ public final class NetworkConnectionPool
         private int refs;
 
         @Override
+        protected NetworkTopicPartition clone()
+        {
+            NetworkTopicPartition result = new NetworkTopicPartition();
+            result.id = id;
+            result.offset = offset;
+            result.refs = refs;
+            return result;
+        }
+
+        @Override
         public int compareTo(
             NetworkTopicPartition that)
         {
-            int comparison = this.id - that.id;
+            int comparison = Integer.compare(this.id, that.id);
 
             if (comparison == 0)
             {
-                comparison = (int)(((this.offset - that.offset) >> 32) & 0xFFFF_FFFF);
+                comparison = Long.compare(this.offset, that.offset);
             }
 
-            if (comparison == 0)
-            {
-                comparison = (int)((this.offset - that.offset) & 0xFFFF_FFFF);
-            }
+            assert compareToResponseValid(that, comparison) : format("compareTo response %d invalid for this=%s, that=%s",
+                    comparison, this, that);
 
             return comparison;
+        }
+
+        private boolean compareToResponseValid(
+            NetworkTopicPartition that,
+            int comparison)
+        {
+            return (comparison == 0 && this.id - that.id == 0 && this.offset - that.offset == 0L)
+                    ||  (comparison < 0 && (this.id < that.id) || (this.offset < that.offset))
+                    ||   (comparison > 0 && (this.id > that.id) || (this.offset > that.offset));
         }
 
         @Override
@@ -2223,14 +2457,13 @@ public final class NetworkConnectionPool
         @Override
         public int hashCode()
         {
-            int offsetHash = id ^ (id >>> 32);
-            return 31 * id + offsetHash;
+            return 31 * id + Long.hashCode(offset);
         }
 
         @Override
         public String toString()
         {
-            return String.format("id=%d, offset=%d, refs=%d", id, offset, refs);
+            return format("(id=%d, offset=%d, refs=%d)", id, offset, refs);
         }
     }
 
@@ -2250,7 +2483,7 @@ public final class NetworkConnectionPool
 
     private static final class TopicMetadata
     {
-        private static final long UNKNOWN_OFFSET = -1L;
+        private static final long NO_OFFSET = -1L;
         private static final int UNKNOWN_BROKER = -1;
 
         private final String topicName;
@@ -2262,6 +2495,7 @@ public final class NetworkConnectionPool
         private int nextBrokerIndex;
         private int[] nodeIdsByPartition;
         private long[] firstOffsetsByPartition;
+        private long[] offsetsOutOfRangeByPartition;
         private List<Consumer<TopicMetadata>> consumers = new ArrayList<>();
         private MetadataRequestType nextRequiredRequestType = MetadataRequestType.METADATA;
 
@@ -2323,7 +2557,7 @@ public final class NetworkConnectionPool
             brokers[nextBrokerIndex++] = new BrokerMetadata(nodeId, host, port);
         }
 
-        public boolean removeBroker(
+        boolean invalidateBroker(
             int brokerId)
         {
             boolean brokerRemoved = false;
@@ -2353,6 +2587,23 @@ public final class NetworkConnectionPool
             return brokerRemoved;
         }
 
+        void invalidate()
+        {
+            errorCode = NONE;
+            compacted = false;
+            deleteRetentionMs = 0;
+            complete = false;
+            if (brokers != null)
+            {
+                Arrays.fill(brokers, null);
+            }
+            if (nodeIdsByPartition != null)
+            {
+                Arrays.fill(nodeIdsByPartition, UNKNOWN_BROKER);
+            }
+            nextRequiredRequestType = MetadataRequestType.METADATA;
+        }
+
         boolean initializePartitions(int partitionCount)
         {
             boolean result = true;
@@ -2360,6 +2611,8 @@ public final class NetworkConnectionPool
             {
                 nodeIdsByPartition = new int[partitionCount];
                 firstOffsetsByPartition = new long[partitionCount];
+                offsetsOutOfRangeByPartition = new long[partitionCount];
+                Arrays.setAll(offsetsOutOfRangeByPartition, i -> NO_OFFSET);
             }
             else if (nodeIdsByPartition.length != partitionCount)
             {
@@ -2379,6 +2632,20 @@ public final class NetworkConnectionPool
             return firstOffsetsByPartition[partitionId];
         }
 
+        long ensureOffsetInRange(
+            int partition,
+            long offset)
+        {
+            long result = offset;
+            if (offsetsOutOfRangeByPartition[partition] == offset)
+            {
+                result = firstOffsetsByPartition[partition];
+                offsetsOutOfRangeByPartition[partition] = NO_OFFSET;
+            }
+            return result;
+        }
+
+
         boolean offsetsRequired(
             int nodeId)
         {
@@ -2388,7 +2655,7 @@ public final class NetworkConnectionPool
                 for (int i=0; i < nodeIdsByPartition.length; i++)
                 {
                     if (nodeIdsByPartition[i] == nodeId &&
-                            firstOffsetsByPartition[i] == UNKNOWN_OFFSET)
+                            offsetsOutOfRangeByPartition[i] != NO_OFFSET)
                     {
                         result = true;
                         break;
@@ -2401,6 +2668,13 @@ public final class NetworkConnectionPool
         void setFirstOffset(int partitionId, long offset)
         {
             firstOffsetsByPartition[partitionId] = offset;
+        }
+
+        public void setOffsetOutOfRange(
+            int partition,
+            long badOffset)
+        {
+            offsetsOutOfRangeByPartition[partition] = badOffset;
         }
 
         void doAttach(
@@ -2452,19 +2726,6 @@ public final class NetworkConnectionPool
             }
             return result;
         }
-
-        void reset()
-        {
-            errorCode = NONE;
-            compacted = false;
-            deleteRetentionMs = 0;
-            complete = false;
-            brokers = null;
-            nextBrokerIndex = 0;
-            nodeIdsByPartition = null;
-            firstOffsetsByPartition = null;
-            nextRequiredRequestType = MetadataRequestType.METADATA;
-        }
     }
 
     private static final class ProgressUpdatingMessageDispatcher  implements MessageDispatcher
@@ -2478,6 +2739,14 @@ public final class NetworkConnectionPool
         {
             offsets = new long[partitions];
             this.progressHandler = progressHandler;
+        }
+
+        @Override
+        public void adjustOffset(
+            int partition,
+            long oldOffset,
+            long newOffset)
+        {
         }
 
         @Override
@@ -2510,7 +2779,7 @@ public final class NetworkConnectionPool
                 progressHandler.handle(partition, offsets[partition], lastOffset);
                 offsets[partition] = lastOffset;
             }
-        };
+        }
     }
 
     private static final class KafkaHeadersIterator implements Iterator<KafkaHeaderFW>

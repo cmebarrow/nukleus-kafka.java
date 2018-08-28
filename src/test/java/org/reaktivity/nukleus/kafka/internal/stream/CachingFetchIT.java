@@ -162,6 +162,17 @@ public class CachingFetchIT
     @Test
     @Specification({
         "${route}/client/controller",
+        "${client}/compacted.header.message.multiple.clients/client",
+        "${server}/compacted.header.first.matches.repeated/server"})
+    @ScriptProperty("networkAccept \"nukleus://target/streams/kafka\"")
+    public void shouldReceiveHistoricalMessageMatchingHeaderFirstFromCache() throws Exception
+    {
+        k3po.finish();
+    }
+
+    @Test
+    @Specification({
+        "${route}/client/controller",
         "${client}/compacted.header.messages.and.tombstone/client",
         "${server}/compacted.header.matches.removed.in.subsequent.response/server"})
     @ScriptProperty("networkAccept \"nukleus://target/streams/kafka\"")
@@ -221,7 +232,6 @@ public class CachingFetchIT
         "${client}/compacted.historical.uses.cached.key.then.live/client",
         "${server}/compacted.historical.uses.cached.key.then.live.no.historical/server"})
     @ScriptProperty("networkAccept \"nukleus://target/streams/kafka\"")
-    // TODO: Fix failure
     public void shouldReceiveCompactedMessageUsingCachedKeyOffsetThenCatchUpToLiveStream() throws Exception
     {
         k3po.start();
@@ -264,20 +274,6 @@ public class CachingFetchIT
         "${server}/compacted.historical.uses.cached.key.then.zero.offset/server"})
     @ScriptProperty("networkAccept \"nukleus://target/streams/kafka\"")
     public void shouldReceiveCompactedMessagesWithUncachedKeyUsingZeroOffset() throws Exception
-    {
-        k3po.finish();
-    }
-
-    @Test
-    @Specification({
-        "${route}/client/controller",
-        "${client}/zero.offset.message/client",
-        "${server}/zero.length.record.batch/server"})
-    @ScriptProperty({
-        "networkAccept \"nukleus://target/streams/kafka\"",
-        "messageOffset 2"
-    })
-    public void shouldSkipZeroLengthRecordBatch() throws Exception
     {
         k3po.finish();
     }
@@ -642,10 +638,10 @@ public class CachingFetchIT
     @Test
     @Specification({
         "${route}/client/controller",
-        "${client}/fetch.key.no.offsets.message/client",
-        "${server}/fetch.key.zero.offset.first.matches/server"})
+        "${client}/fetch.key.unspecified.offset.message/client",
+        "${server}/fetch.key.high.water.mark.offset.first.matches/server"})
     @ScriptProperty("networkAccept \"nukleus://target/streams/kafka\"")
-    public void shouldReceiveMessageMatchingFetchKeyFirstWithZeroLengthOffsetsArray() throws Exception
+    public void shouldReceiveLiveMessageMatchingFetchKey() throws Exception
     {
         k3po.finish();
     }
@@ -898,19 +894,6 @@ public class CachingFetchIT
         "${server}/zero.offset.message/server" })
     @ScriptProperty("networkAccept \"nukleus://target/streams/kafka\"")
     public void shouldReceiveMessageAtZeroOffset() throws Exception
-    {
-        k3po.start();
-        k3po.notifyBarrier("WRITE_FETCH_RESPONSE");
-        k3po.finish();
-    }
-
-    @Test
-    @Specification({
-        "${route}/client/controller",
-        "${client}/no.offsets.message/client",
-        "${server}/zero.offset.message/server" })
-    @ScriptProperty("networkAccept \"nukleus://target/streams/kafka\"")
-    public void shouldReceiveMessageAtZeroOffsetWhenEmptyOffsetsArray() throws Exception
     {
         k3po.start();
         k3po.notifyBarrier("WRITE_FETCH_RESPONSE");

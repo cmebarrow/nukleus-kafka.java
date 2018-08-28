@@ -109,7 +109,7 @@ public final class ClientStreamFactoryBuilder implements StreamFactoryBuilder
     }
 
     @Override
-    public ClientStreamFactoryBuilder setCorrelationIdSupplier(
+    public ClientStreamFactoryBuilder setTargetCorrelationIdSupplier(
         LongSupplier supplyCorrelationId)
     {
         this.supplyCorrelationId = supplyCorrelationId;
@@ -139,6 +139,6 @@ public final class ClientStreamFactoryBuilder implements StreamFactoryBuilder
         final MemoryManager memoryManager = supplyMemoryManager.apply(supplyCounter);
 
         return new ClientStreamFactory(config, router, writeBuffer, bufferPool, memoryManager, supplyStreamId, supplyTrace,
-                supplyCorrelationId, correlations, connectionPools, connectPoolFactoryConsumer);
+                supplyCorrelationId, supplyCounter, correlations, connectionPools, connectPoolFactoryConsumer);
     }
 }
