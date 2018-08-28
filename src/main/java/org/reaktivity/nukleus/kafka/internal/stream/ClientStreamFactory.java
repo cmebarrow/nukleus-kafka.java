@@ -76,6 +76,11 @@ public final class ClientStreamFactory implements StreamFactory
         .wrap(new UnsafeBuffer(new byte[4]), 0, 4)
         .build();
 
+    private static final PartitionProgressHandler NOOP_PROGRESS_HANDLER = (p, f, n) ->
+    {
+
+    };
+
     private final UnsafeBuffer workBuffer1 = new UnsafeBuffer(EMPTY_BYTE_ARRAY);
     private final UnsafeBuffer workBuffer2 = new UnsafeBuffer(EMPTY_BYTE_ARRAY);
 
@@ -565,6 +570,7 @@ public final class ClientStreamFactory implements StreamFactory
         {
             budget.leaveGroup();
             doAbort(applicationReply, applicationReplyId);
+            progressHandler = NOOP_PROGRESS_HANDLER;
             networkPool.doDetach(networkAttachId, fetchOffsets);
             networkAttachId = UNATTACHED;
         }
@@ -848,7 +854,7 @@ public final class ClientStreamFactory implements StreamFactory
                     ListFW<KafkaHeaderFW> headers = beginEx.headers();
                     if (headers != null && headers.sizeof() > 0)
                     {
-                        MutableDirectBuffer headersBuffer = new UnsafeBuffer(new byte[headers.limit() - headers.offset()]);
+                        MutableDirectBuffer headersBuffer = new UnsafeBuffer(new byte[headers.sizeof()]);
                         headersBuffer.putBytes(0, headers.buffer(),  headers.offset(), headers.sizeof());
                         headers = new ListFW<KafkaHeaderFW>(new KafkaHeaderFW()).wrap(headersBuffer, 0, headersBuffer.capacity());
                     }
@@ -856,7 +862,7 @@ public final class ClientStreamFactory implements StreamFactory
                     if (fetchKey != null)
                     {
                         subscribedByKey = true;
-                        MutableDirectBuffer keyBuffer = new UnsafeBuffer(new byte[fetchKey.limit() - fetchKey.offset()]);
+                        MutableDirectBuffer keyBuffer = new UnsafeBuffer(new byte[fetchKey.sizeof()]);
                         keyBuffer.putBytes(0, fetchKey.buffer(),  fetchKey.offset(), fetchKey.sizeof());
                         fetchKey = new OctetsFW().wrap(keyBuffer, 0, keyBuffer.capacity());
                         hashCode = hashCodesCount == 1 ? beginEx.fetchKeyHash().nextInt()
@@ -971,10 +977,11 @@ public final class ClientStreamFactory implements StreamFactory
         private void handleReset(
             ResetFW reset)
         {
+            doReset(applicationThrottle, applicationId);
+            budget.leaveGroup();
+            progressHandler = NOOP_PROGRESS_HANDLER;
             networkPool.doDetach(networkAttachId, fetchOffsets);
             networkAttachId = UNATTACHED;
-            budget.leaveGroup();
-            doReset(applicationThrottle, applicationId);
         }
 
         private int writeableBytes()
