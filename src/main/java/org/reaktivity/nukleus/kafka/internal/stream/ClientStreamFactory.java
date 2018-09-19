@@ -761,12 +761,13 @@ public final class ClientStreamFactory implements StreamFactory
         public String toString()
         {
             return format("fetchOffsets %s, fragmentedMessageOffset %d, fragmentedMessagePartition %d, " +
-                                 "applicationId %x, applicationReplyId %x",
+                                 "applicationId %x, applicationReplyId %x, applicationReplyBudget = %d",
                     ClientAcceptStream.this.fetchOffsets,
                     ClientAcceptStream.this.fragmentedMessageOffset,
                     ClientAcceptStream.this.fragmentedMessagePartition,
                     ClientAcceptStream.this.applicationId,
-                    ClientAcceptStream.this.applicationReplyId);
+                    ClientAcceptStream.this.applicationReplyId,
+                    ClientAcceptStream.this.budget.applicationReplyBudget());
         }
 
         private String toString(
@@ -800,6 +801,13 @@ public final class ClientStreamFactory implements StreamFactory
                     doKafkaDataContinuation(applicationReply, applicationReplyId, pendingMessageTraceId,
                             applicationReplyPadding, flags, pendingMessageValue, pendingMessageValueOffset,
                             pendingMessageValueLimit);
+
+                    if (Flags.fin(flags))
+                    {
+                        // Fragmented message completed. This may unblock dispatching for other partitions (broker
+                        // (connections). Schedule doFlush to make sure these get activated and avoid stuck flow.
+                        networkPool.doFlush();
+                    }
                 }
 
                 messagePending = false;
