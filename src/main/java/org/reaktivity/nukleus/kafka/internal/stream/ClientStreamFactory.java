@@ -791,10 +791,11 @@ public final class ClientStreamFactory implements StreamFactory
                 if (pendingMessageValueOffset == 0)
                 {
                     flags |= INIT;
-                    this.fetchOffsets.put(partition, nextFetchOffset);
+                    long previous = this.fetchOffsets.put(partition, nextFetchOffset);
                     doKafkaData(applicationReply, applicationReplyId, pendingMessageTraceId, applicationReplyPadding, flags,
                                 compacted ? pendingMessageKey : null,
                                 pendingMessageTimestamp, pendingMessageValue, pendingMessageValueLimit, fetchOffsets);
+                    this.fetchOffsets.put(partition, previous);
                 }
                 else
                 {
