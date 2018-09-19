@@ -736,6 +736,7 @@ public final class ClientStreamFactory implements StreamFactory
 
             if (fragmentedMessageOffset != UNSET &&
                 fragmentedMessagePartition == partition &&
+                requestOffset <= fragmentedMessageOffset &&
                 !fragmentedMessageDispatched &&
                 startOffset <= fragmentedMessageOffset &&
                 nextFetchOffset > fragmentedMessageOffset)
