@@ -42,6 +42,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.function.BiConsumer;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.IntConsumer;
@@ -330,7 +331,7 @@ public final class NetworkConnectionPool
 
         if (metadataConnection == null)
         {
-            metadataConnection = new MetadataConnection();
+            metadataConnection = new MetadataConnection(this);
         }
 
         metadataConnection.doRequestIfNeeded();
@@ -420,7 +421,7 @@ public final class NetworkConnectionPool
                     m -> addRoute(topicName, routeHeaders, proactive, onMetadataError, m));
             if (metadataConnection == null)
             {
-                metadataConnection = new MetadataConnection();
+                metadataConnection = new MetadataConnection(this);
             }
             metadataConnection.doRequestIfNeeded();
         }
@@ -478,7 +479,7 @@ public final class NetworkConnectionPool
     private <T extends AbstractFetchConnection> T[] applyBrokerMetadata(
         T[] connections,
         BrokerMetadata broker,
-        Function<BrokerMetadata, T> createConnection)
+        BiFunction<NetworkConnectionPool, BrokerMetadata, T> createConnection)
     {
         T[] result = connections;
         AbstractFetchConnection current = null;
@@ -492,14 +493,14 @@ public final class NetworkConnectionPool
                 {
                     // Change in cluster configuration
                     connection.close();
-                    current = createConnection.apply(broker);
+                    current = createConnection.apply(this, broker);
                 }
                 break;
             }
         }
         if (current == null)
         {
-            result = ArrayUtil.add(connections, createConnection.apply(broker));
+            result = ArrayUtil.add(connections, createConnection.apply(this, broker));
         }
         return result;
     }
@@ -559,7 +560,7 @@ public final class NetworkConnectionPool
         historicalConnections = ArrayUtil.remove(historicalConnections, connection);
     }
 
-    abstract class AbstractNetworkConnection
+    abstract static class AbstractNetworkConnection
     {
         final MessageConsumer networkTarget;
         Timer timer;
@@ -585,10 +586,16 @@ public final class NetworkConnectionPool
 
         final MutableDirectBuffer localDecodeBuffer;
 
-        private AbstractNetworkConnection()
+        final ClientStreamFactory clientStreamFactory;
+        final NetworkConnectionPool pool;
+
+        private AbstractNetworkConnection(
+            NetworkConnectionPool pool)
         {
-            this.networkTarget = NetworkConnectionPool.this.clientStreamFactory.router.supplyTarget(networkName);
-            localDecodeBuffer = new UnsafeBuffer(allocateDirect(fetchPartitionMaxBytes));
+            this.clientStreamFactory = pool.clientStreamFactory;
+            this.pool = pool;
+            this.networkTarget = clientStreamFactory.router.supplyTarget(pool.networkName);
+            localDecodeBuffer = new UnsafeBuffer(allocateDirect(pool.fetchPartitionMaxBytes));
             timer = clientStreamFactory.scheduler.newBlankTimer();
         }
 
@@ -625,15 +632,15 @@ public final class NetworkConnectionPool
                 //       if choose to give up, say after maximum retry attempts,
                 //       then send END to each consumer to clean up
 
-                final long newNetworkId = NetworkConnectionPool.this.clientStreamFactory.supplyStreamId.getAsLong();
-                final long newCorrelationId = NetworkConnectionPool.this.clientStreamFactory.supplyCorrelationId.getAsLong();
+                final long newNetworkId = clientStreamFactory.supplyStreamId.getAsLong();
+                final long newCorrelationId = clientStreamFactory.supplyCorrelationId.getAsLong();
 
-                NetworkConnectionPool.this.clientStreamFactory.correlations.put(newCorrelationId, AbstractNetworkConnection.this);
+                clientStreamFactory.correlations.put(newCorrelationId, AbstractNetworkConnection.this);
 
-                NetworkConnectionPool.this.clientStreamFactory
-                    .doBegin(networkTarget, newNetworkId, networkRef, newCorrelationId, extensionVisitor);
-                NetworkConnectionPool.this.clientStreamFactory.router.setThrottle(
-                        networkName, newNetworkId, this::handleThrottle);
+                clientStreamFactory
+                    .doBegin(networkTarget, newNetworkId, pool.networkRef, newCorrelationId, extensionVisitor);
+                clientStreamFactory.router.setThrottle(
+                        pool.networkName, newNetworkId, this::handleThrottle);
 
                 this.networkId = newNetworkId;
                 this.networkCorrelationId = newCorrelationId;
@@ -644,25 +651,25 @@ public final class NetworkConnectionPool
 
         final void metadataRequestIdle()
         {
-            routeCounters.metadataRequestIdleTimeouts.getAsLong();
+            pool.routeCounters.metadataRequestIdleTimeouts.getAsLong();
             idle();
         }
 
         final void describeConfigsRequestIdle()
         {
-            routeCounters.describeConfigsRequestIdleTimeouts.getAsLong();
+            pool.routeCounters.describeConfigsRequestIdleTimeouts.getAsLong();
             idle();
         }
 
         final void fetchRequestIdle()
         {
-            routeCounters.fetchRequestIdleTimeouts.getAsLong();
+            pool.routeCounters.fetchRequestIdleTimeouts.getAsLong();
             idle();
         }
 
         final void listOffsetsRequestIdle()
         {
-            routeCounters.listOffsetsRequestIdleTimeouts.getAsLong();
+            pool.routeCounters.listOffsetsRequestIdleTimeouts.getAsLong();
             idle();
         }
 
@@ -701,7 +708,7 @@ public final class NetworkConnectionPool
             switch (msgTypeId)
             {
             case WindowFW.TYPE_ID:
-                final WindowFW window = windowRO.wrap(buffer, index, index + length);
+                final WindowFW window = clientStreamFactory.windowRO.wrap(buffer, index, index + length);
                 handleWindow(window);
                 break;
             case ResetFW.TYPE_ID:
@@ -775,19 +782,19 @@ public final class NetworkConnectionPool
             switch (msgTypeId)
             {
             case DataFW.TYPE_ID:
-                final DataFW data = NetworkConnectionPool.this.clientStreamFactory.dataRO.wrap(buffer, index, index + length);
+                final DataFW data = clientStreamFactory.dataRO.wrap(buffer, index, index + length);
                 handleData(data);
                 break;
             case EndFW.TYPE_ID:
-                final EndFW end = NetworkConnectionPool.this.clientStreamFactory.endRO.wrap(buffer, index, index + length);
+                final EndFW end = clientStreamFactory.endRO.wrap(buffer, index, index + length);
                 handleEnd(end);
                 break;
             case AbortFW.TYPE_ID:
-                final AbortFW abort = NetworkConnectionPool.this.clientStreamFactory.abortRO.wrap(buffer, index, index + length);
+                final AbortFW abort = clientStreamFactory.abortRO.wrap(buffer, index, index + length);
                 handleAbort(abort);
                 break;
             default:
-                NetworkConnectionPool.this.clientStreamFactory.doReset(networkReplyThrottle, networkReplyId);
+                clientStreamFactory.doReset(networkReplyThrottle, networkReplyId);
                 break;
             }
         }
@@ -801,7 +808,7 @@ public final class NetworkConnectionPool
             switch (msgTypeId)
             {
             case DataFW.TYPE_ID:
-                final DataFW data = NetworkConnectionPool.this.clientStreamFactory.dataRO.wrap(buffer, index, index + length);
+                final DataFW data = clientStreamFactory.dataRO.wrap(buffer, index, index + length);
                 handleData(data);
                 break;
             case EndFW.TYPE_ID:
@@ -809,7 +816,7 @@ public final class NetworkConnectionPool
                 doReinitialize();
                 break;
             default:
-                NetworkConnectionPool.this.clientStreamFactory.doReset(networkReplyThrottle, networkReplyId);
+                clientStreamFactory.doReset(networkReplyThrottle, networkReplyId);
                 break;
             }
         }
@@ -827,7 +834,7 @@ public final class NetworkConnectionPool
             DataFW data)
         {
             timer.cancel();
-            clientStreamFactory.scheduler.rescheduleTimeout(readIdleTimeout, timer);
+            clientStreamFactory.scheduler.rescheduleTimeout(pool.readIdleTimeout, timer);
 
             final OctetsFW payload = data.payload();
             final long networkTraceId = data.trace();
@@ -836,7 +843,7 @@ public final class NetworkConnectionPool
 
             if (networkResponseBudget < 0)
             {
-                NetworkConnectionPool.this.clientStreamFactory.doReset(networkReplyThrottle, networkReplyId);
+                clientStreamFactory.doReset(networkReplyThrottle, networkReplyId);
             }
             else
             {
@@ -849,7 +856,7 @@ public final class NetworkConnectionPool
                     if (networkSlot != NO_SLOT)
                     {
                         final MutableDirectBuffer bufferSlot =
-                                networkSlot == LOCAL_SLOT ? localDecodeBuffer : bufferPool.buffer(networkSlot);
+                                networkSlot == LOCAL_SLOT ? localDecodeBuffer : pool.bufferPool.buffer(networkSlot);
                         final int networkRemaining = networkLimit - networkOffset;
 
                         bufferSlot.putBytes(networkSlotOffset, networkBuffer, networkOffset, networkRemaining);
@@ -860,7 +867,7 @@ public final class NetworkConnectionPool
                         networkLimit = networkSlotOffset;
                     }
 
-                    ResponseHeaderFW response = responseRO.tryWrap(networkBuffer, networkOffset, networkLimit);
+                    ResponseHeaderFW response = pool.responseRO.tryWrap(networkBuffer, networkOffset, networkLimit);
                     if (response == null || response.limit() + response.size() > networkLimit)
                     {
                         if (networkSlot == NO_SLOT)
@@ -885,11 +892,11 @@ public final class NetworkConnectionPool
                         {
                             if (networkSlot == NO_SLOT)
                             {
-                                networkSlot = bufferPool.acquire(networkReplyId);
+                                networkSlot = pool.bufferPool.acquire(networkReplyId);
                             }
 
                             final MutableDirectBuffer bufferSlot =
-                                    bufferPool.buffer(networkSlot);
+                                    pool.bufferPool.buffer(networkSlot);
                             bufferSlot.putBytes(0, networkBuffer, networkOffset, networkLimit - networkOffset);
                             networkSlotOffset = networkLimit - networkOffset;
                         }
@@ -959,7 +966,7 @@ public final class NetworkConnectionPool
 
             if (networkResponseCredit > 0)
             {
-                NetworkConnectionPool.this.clientStreamFactory.doWindow(
+                clientStreamFactory.doWindow(
                         networkReplyThrottle, networkReplyId, networkResponseCredit, 0, 0);
 
                 this.networkResponseBudget += networkResponseCredit;
@@ -979,7 +986,7 @@ public final class NetworkConnectionPool
         }
     }
 
-    abstract class AbstractFetchConnection extends AbstractNetworkConnection
+    abstract static class AbstractFetchConnection extends AbstractNetworkConnection
     {
         private static final long EARLIEST_AVAILABLE_OFFSET = -2L;
         private static final long NEXT_OFFSET = -1L; // high water mark (offset of the next published message)
@@ -997,10 +1004,11 @@ public final class NetworkConnectionPool
         private final LongSupplier fetches;
 
         private AbstractFetchConnection(
+            final NetworkConnectionPool pool,
             BrokerMetadata broker,
             LongSupplier fetches)
         {
-            super();
+            super(pool);
             this.brokerId = broker.nodeId;
             this.host = broker.host;
             this.port = broker.port;
@@ -1019,7 +1027,7 @@ public final class NetworkConnectionPool
             {
                 doBeginIfNotConnected((b, o, m) ->
                 {
-                    return tcpBeginExRW.wrap(b, o, m)
+                    return pool.tcpBeginExRW.wrap(b, o, m)
                             .localAddress(lab -> lab.ipv4Address(ob -> ob.put(ANY_IP_ADDR)))
                                       .localPort(0)
                                       .remoteAddress(rab -> rab.host(host))
@@ -1051,9 +1059,9 @@ public final class NetworkConnectionPool
         {
             final int encodeOffset = 0;
             encodeLimit = encodeOffset;
-            RequestHeaderFW request = requestRW.wrap(
-                    NetworkConnectionPool.this.encodeBuffer, encodeLimit,
-                    NetworkConnectionPool.this.encodeBuffer.capacity())
+            RequestHeaderFW request = pool.requestRW.wrap(
+                    pool.encodeBuffer, encodeLimit,
+                    pool.encodeBuffer.capacity())
                     .size(0)
                     .apiKey(FETCH_API_KEY)
                     .apiVersion(FETCH_API_VERSION)
@@ -1062,24 +1070,24 @@ public final class NetworkConnectionPool
                     .build();
 
             encodeLimit = request.limit();
-            FetchRequestFW fetchRequest = fetchRequestRW.wrap(
-                    NetworkConnectionPool.this.encodeBuffer, encodeLimit,
-                    NetworkConnectionPool.this.encodeBuffer.capacity())
+            FetchRequestFW fetchRequest = pool.fetchRequestRW.wrap(
+                    pool.encodeBuffer, encodeLimit,
+                    pool.encodeBuffer.capacity())
                     .maxWaitTimeMillis(500)
                     .minBytes(1)
-                    .maxBytes(fetchMaxBytes)
+                    .maxBytes(pool.fetchMaxBytes)
                     .isolationLevel((byte) 0)
                     .topicCount(0)
                     .build();
 
             encodeLimit = fetchRequest.limit();
             int topicCount = 0;
-            for (String topicName : topicsByName.keySet())
+            for (String topicName : pool.topicsByName.keySet())
             {
                 final int originalEncodeLimit = encodeLimit;
-                TopicRequestFW topicRequest = topicRequestRW.wrap(
-                        NetworkConnectionPool.this.encodeBuffer, encodeLimit,
-                        NetworkConnectionPool.this.encodeBuffer.capacity())
+                TopicRequestFW topicRequest = pool.topicRequestRW.wrap(
+                        pool.encodeBuffer, encodeLimit,
+                        pool.encodeBuffer.capacity())
                         .name(topicName)
                         .partitionCount(0)
                         .build();
@@ -1088,15 +1096,15 @@ public final class NetworkConnectionPool
 
                 long[] requestedOffsets = requestedFetchOffsetsByTopic.computeIfAbsent(
                         topicName,
-                        k  ->  new long[topicMetadataByName.get(topicName).partitionCount()]);
+                        k  ->  new long[pool.topicMetadataByName.get(topicName).partitionCount()]);
                 int partitionCount = addTopicToRequest(topicName,
                         (p, o) -> requestedOffsets[p] = o,
                         (p) -> requestedOffsets[p]);
 
                 if (partitionCount > 0)
                 {
-                    NetworkConnectionPool.this.topicRequestRW
-                          .wrap(NetworkConnectionPool.this.encodeBuffer, topicRequest.offset(), topicRequest.limit())
+                    pool.topicRequestRW
+                          .wrap(pool.encodeBuffer, topicRequest.offset(), topicRequest.limit())
                           .name(topicRequest.name())
                           .partitionCount(partitionCount)
                           .build();
@@ -1111,8 +1119,8 @@ public final class NetworkConnectionPool
             // TODO: stream large requests in multiple DATA frames as needed
             if (topicCount > 0 && encodeLimit - encodeOffset + networkRequestPadding <= networkRequestBudget)
             {
-                NetworkConnectionPool.this.fetchRequestRW
-                    .wrap(NetworkConnectionPool.this.encodeBuffer, fetchRequest.offset(), fetchRequest.limit())
+                pool.fetchRequestRW
+                    .wrap(pool.encodeBuffer, fetchRequest.offset(), fetchRequest.limit())
                     .maxWaitTimeMillis(fetchRequest.maxWaitTimeMillis())
                     .minBytes(fetchRequest.minBytes())
                     .maxBytes(fetchRequest.maxBytes())
@@ -1121,8 +1129,8 @@ public final class NetworkConnectionPool
                     .build();
 
                 int newCorrelationId = nextRequestId++;
-                NetworkConnectionPool.this.requestRW
-                    .wrap(NetworkConnectionPool.this.encodeBuffer, request.offset(), request.limit())
+                pool.requestRW
+                    .wrap(pool.encodeBuffer, request.offset(), request.limit())
                     .size(encodeLimit - encodeOffset - RequestHeaderFW.FIELD_OFFSET_API_KEY)
                     .apiKey(FETCH_API_KEY)
                     .apiVersion(FETCH_API_VERSION)
@@ -1130,19 +1138,19 @@ public final class NetworkConnectionPool
                     .clientId((String) null)
                     .build();
 
-                OctetsFW payload = NetworkConnectionPool.this.payloadRW
-                    .wrap(NetworkConnectionPool.this.encodeBuffer, encodeOffset, encodeLimit)
+                OctetsFW payload = pool.payloadRW
+                    .wrap(pool.encodeBuffer, encodeOffset, encodeLimit)
                     .set((b, o, m) -> m - o)
                     .build();
 
                 fetches.getAsLong();
 
-                NetworkConnectionPool.this.clientStreamFactory.doData(networkTarget, networkId,
+                clientStreamFactory.doData(networkTarget, networkId,
                         networkRequestPadding, payload);
                 networkRequestBudget -= payload.sizeof() + networkRequestPadding;
 
                 timer.cancel();
-                clientStreamFactory.scheduler.rescheduleTimeout(readIdleTimeout, timer, this::fetchRequestIdle);
+                clientStreamFactory.scheduler.rescheduleTimeout(pool.readIdleTimeout, timer, this::fetchRequestIdle);
             }
         }
 
@@ -1152,9 +1160,9 @@ public final class NetworkConnectionPool
             final int encodeOffset = 0;
             int encodeLimit = encodeOffset;
 
-            RequestHeaderFW request = requestRW.wrap(
-                    NetworkConnectionPool.this.encodeBuffer, encodeLimit,
-                    NetworkConnectionPool.this.encodeBuffer.capacity())
+            RequestHeaderFW request = pool.requestRW.wrap(
+                    pool.encodeBuffer, encodeLimit,
+                    pool.encodeBuffer.capacity())
                     .size(0)
                     .apiKey(LIST_OFFSETS_API_KEY)
                     .apiVersion(LIST_OFFSETS_API_VERSION)
@@ -1164,9 +1172,9 @@ public final class NetworkConnectionPool
 
             encodeLimit = request.limit();
 
-            ListOffsetsRequestFW listOffsetsRequest = listOffsetsRequestRW.wrap(
-                    NetworkConnectionPool.this.encodeBuffer, encodeLimit,
-                    NetworkConnectionPool.this.encodeBuffer.capacity())
+            ListOffsetsRequestFW listOffsetsRequest = pool.listOffsetsRequestRW.wrap(
+                    pool.encodeBuffer, encodeLimit,
+                    pool.encodeBuffer.capacity())
                     .isolationLevel(b -> b.set(IsolationLevel.READ_UNCOMMITTED))
                     .topicCount(0)
                     .build();
@@ -1175,15 +1183,15 @@ public final class NetworkConnectionPool
 
             int topicCount = 0;
 
-            for (TopicMetadata topicMetadata : topicMetadataByName.values())
+            for (TopicMetadata topicMetadata : pool.topicMetadataByName.values())
             {
                 int partitionCount = topicMetadata.offsetsRequired(brokerId);
                 if (partitionCount > 0)
                 {
                     topicCount++;
-                    ListOffsetsTopicFW listOffsetsTopic = listOffsetsTopicRW.wrap(
-                            NetworkConnectionPool.this.encodeBuffer, encodeLimit,
-                            NetworkConnectionPool.this.encodeBuffer.capacity())
+                    ListOffsetsTopicFW listOffsetsTopic = pool.listOffsetsTopicRW.wrap(
+                            pool.encodeBuffer, encodeLimit,
+                            pool.encodeBuffer.capacity())
                             .name(topicMetadata.topicName)
                             .partitionCount(partitionCount)
                             .build();
@@ -1198,9 +1206,10 @@ public final class NetworkConnectionPool
                             long requestedTimestamp = topicMetadata.offsetsOutOfRangeByPartition[partitionId] == MAX_OFFSET
                                     ? NEXT_OFFSET
                                     : EARLIEST_AVAILABLE_OFFSET;
-                            ListOffsetsPartitionRequestFW listOffsetsPartitionRequest = listOffsetsPartitionRequestRW.wrap(
-                                    NetworkConnectionPool.this.encodeBuffer, encodeLimit,
-                                    NetworkConnectionPool.this.encodeBuffer.capacity())
+                            ListOffsetsPartitionRequestFW
+                                listOffsetsPartitionRequest = pool.listOffsetsPartitionRequestRW.wrap(
+                                    pool.encodeBuffer, encodeLimit,
+                                    pool.encodeBuffer.capacity())
                                     .partitionId(partitionId)
                                     .timestamp(requestedTimestamp)
                                     .build();
@@ -1216,8 +1225,8 @@ public final class NetworkConnectionPool
             {
                 int newCorrelationId = nextRequestId++;
 
-                NetworkConnectionPool.this.requestRW
-                         .wrap(NetworkConnectionPool.this.encodeBuffer, request.offset(), request.limit())
+                pool.requestRW
+                         .wrap(pool.encodeBuffer, request.offset(), request.limit())
                          .size(encodeLimit - encodeOffset - RequestHeaderFW.FIELD_OFFSET_API_KEY)
                          .apiKey(LIST_OFFSETS_API_KEY)
                          .apiVersion(LIST_OFFSETS_API_VERSION)
@@ -1225,22 +1234,22 @@ public final class NetworkConnectionPool
                          .clientId((String) null)
                          .build();
 
-                listOffsetsRequestRW.wrap(encodeBuffer, listOffsetsRequest.offset(), listOffsetsRequest.limit())
+                pool.listOffsetsRequestRW.wrap(pool.encodeBuffer, listOffsetsRequest.offset(), listOffsetsRequest.limit())
                         .isolationLevel(b -> b.set(IsolationLevel.READ_UNCOMMITTED))
                         .topicCount(topicCount)
                         .build();
 
-                OctetsFW payload = NetworkConnectionPool.this.payloadRW
-                        .wrap(NetworkConnectionPool.this.encodeBuffer, encodeOffset, encodeLimit)
+                OctetsFW payload = pool.payloadRW
+                        .wrap(pool.encodeBuffer, encodeOffset, encodeLimit)
                         .set((b, o, m) -> m - o)
                         .build();
 
-                NetworkConnectionPool.this.clientStreamFactory.doData(networkTarget, networkId,
+                clientStreamFactory.doData(networkTarget, networkId,
                         networkRequestPadding, payload);
                 networkRequestBudget -= payload.sizeof() + networkRequestPadding;
 
                 timer.cancel();
-                clientStreamFactory.scheduler.rescheduleTimeout(readIdleTimeout, timer, this::listOffsetsRequestIdle);
+                clientStreamFactory.scheduler.rescheduleTimeout(pool.readIdleTimeout, timer, this::listOffsetsRequestIdle);
             }
         }
 
@@ -1260,13 +1269,13 @@ public final class NetworkConnectionPool
             else
             {
                 timer.cancel();
-                clientStreamFactory.scheduler.rescheduleTimeout(readIdleTimeout, timer);
+                clientStreamFactory.scheduler.rescheduleTimeout(pool.readIdleTimeout, timer);
 
                 final OctetsFW payload = data.payload();
                 networkResponseBudget -= payload.sizeof() + data.padding();
                 if (networkResponseBudget < 0)
                 {
-                    NetworkConnectionPool.this.clientStreamFactory.doReset(networkReplyThrottle, networkReplyId);
+                    clientStreamFactory.doReset(networkReplyThrottle, networkReplyId);
                 }
                 int excessBytes = fetchResponseDecoder.decode(payload, data.trace());
                 doOfferResponseBudget();
@@ -1301,7 +1310,7 @@ public final class NetworkConnectionPool
         {
             timer.cancel();
 
-            final ListOffsetsResponseFW response = listOffsetsResponseRO.tryWrap(networkBuffer, networkOffset, networkLimit);
+            final ListOffsetsResponseFW response = pool.listOffsetsResponseRO.tryWrap(networkBuffer, networkOffset, networkLimit);
             if (response == null)
             {
                 abort();
@@ -1314,7 +1323,7 @@ public final class NetworkConnectionPool
             KafkaError errorCode = NONE;
             for (int topicIndex = 0; topicIndex < topicCount && errorCode == NONE; topicIndex++)
             {
-                final ListOffsetsTopicFW topic = listOffsetsTopicRO.tryWrap(networkBuffer, networkOffset, networkLimit);
+                final ListOffsetsTopicFW topic = pool.listOffsetsTopicRO.tryWrap(networkBuffer, networkOffset, networkLimit);
                 if (topic == null)
                 {
                     abort();
@@ -1323,7 +1332,7 @@ public final class NetworkConnectionPool
 
                 final String16FW name = topic.name();
                 String topicName = name.asString();
-                TopicMetadata topicMetadata = topicMetadataByName.get(topicName);
+                TopicMetadata topicMetadata = pool.topicMetadataByName.get(topicName);
                 networkOffset = topic.limit();
 
                 final int partitionCount = topic.partitionCount();
@@ -1331,7 +1340,7 @@ public final class NetworkConnectionPool
                 for (int i = 0; i < partitionCount && errorCode == NONE; i++)
                 {
                     final ListOffsetsPartitionResponseFW partition =
-                            listOffsetsPartitionResponseRO.tryWrap(networkBuffer, networkOffset, networkLimit);
+                            pool.listOffsetsPartitionResponseRO.tryWrap(networkBuffer, networkOffset, networkLimit);
                     if (partition == null)
                     {
                         abort();
@@ -1363,7 +1372,7 @@ public final class NetworkConnectionPool
                     }
                     else
                     {
-                        NetworkTopic networkTopic = topicsByName.get(topicName);
+                        NetworkTopic networkTopic = pool.topicsByName.get(topicName);
 
                         // networkTopic can be null if all clients have detached (e.g.
                         // because we called detach while processing a previous partition response)
@@ -1407,18 +1416,18 @@ public final class NetworkConnectionPool
         {
             invalidateConnectionMetadata();
             removeConnection();
-            metadataConnection.doRequestIfNeeded();
+            pool.metadataConnection.doRequestIfNeeded();
         }
 
         abstract void removeConnection();
 
         private void invalidateConnectionMetadata()
         {
-            for (TopicMetadata metadata : topicMetadataByName.values())
+            for (TopicMetadata metadata : pool.topicMetadataByName.values())
             {
                 if (metadata.invalidateBroker(brokerId))
                 {
-                    int newAttachId = nextAttachId++;
+                    int newAttachId = pool.nextAttachId++;
                     metadata.doAttach(newAttachId, this::metadataUpdated);
                 }
             }
@@ -1426,13 +1435,13 @@ public final class NetworkConnectionPool
 
         private void metadataUpdated(TopicMetadata metadata)
         {
-            doConnections(metadata);
-            doFlush();
+            pool.doConnections(metadata);
+            pool.doFlush();
         }
 
         private DecoderMessageDispatcher getTopicDispatcher(String topicName)
         {
-            NetworkTopic topic = topicsByName.get(topicName);
+            NetworkTopic topic = pool.topicsByName.get(topicName);
 
             // topic may be null if everyone has unsubscribed
             return topic == null ? NOOP_DISPATCHER : topic.dispatcher;
@@ -1443,7 +1452,7 @@ public final class NetworkConnectionPool
             int partition,
             KafkaError errorCode)
         {
-            TopicMetadata metadata = topicMetadataByName.get(topicName);
+            TopicMetadata metadata = pool.topicMetadataByName.get(topicName);
 
             switch(errorCode)
             {
@@ -1467,8 +1476,8 @@ public final class NetworkConnectionPool
                     metadata.setErrorCode(errorCode);
                     metadata.scheduleRefresh(
                             clientStreamFactory.scheduler,
-                            metadataBackoffMillis,
-                            metadataConnection);
+                            pool.metadataBackoffMillis,
+                            pool.metadataConnection);
                     System.out.format(
                             "Fetch failed for topic \"%s\" partition %d due to Kafka error code %s, retrying...\n",
                             topicName, partition, errorCode);
@@ -1494,11 +1503,13 @@ public final class NetworkConnectionPool
         }
     }
 
-    private final class LiveFetchConnection extends AbstractFetchConnection
+    private static final class LiveFetchConnection extends AbstractFetchConnection
     {
-        LiveFetchConnection(BrokerMetadata broker)
+        LiveFetchConnection(
+            final NetworkConnectionPool pool,
+            BrokerMetadata broker)
         {
-            super(broker, NO_COUNTER);
+            super(pool, broker, NO_COUNTER);
         }
 
         @Override
@@ -1507,9 +1518,9 @@ public final class NetworkConnectionPool
             IntLongConsumer setRequestedOffset,
             IntToLongFunction getRequestedOffset)
         {
-            final NetworkTopic topic = topicsByName.get(topicName);
+            final NetworkTopic topic = pool.topicsByName.get(topicName);
             final int maxPartitionBytes = topic.maximumWritableBytes(true);
-            final TopicMetadata metadata = topicMetadataByName.get(topicName);
+            final TopicMetadata metadata = pool.topicMetadataByName.get(topicName);
 
             int partitionCount = 0;
 
@@ -1538,9 +1549,9 @@ public final class NetworkConnectionPool
                         else
                         {
                             long offset = metadata.ensureOffsetInRange(candidate.id, candidate.offset);
-                            PartitionRequestFW partitionRequest = NetworkConnectionPool.this.partitionRequestRW
-                                    .wrap(NetworkConnectionPool.this.encodeBuffer, encodeLimit,
-                                            NetworkConnectionPool.this.encodeBuffer.capacity())
+                            PartitionRequestFW partitionRequest = pool.partitionRequestRW
+                                    .wrap(pool.encodeBuffer, encodeLimit,
+                                            pool.encodeBuffer.capacity())
                                     .partitionId(candidate.id).fetchOffset(offset).maxBytes(maxPartitionBytes).build();
 
                             long requestedOffset = candidate.offset;
@@ -1553,8 +1564,8 @@ public final class NetworkConnectionPool
 
                                 // Prepare to update the partition offset later
                                 NetworkTopicPartition partition = candidate.clone();
-                                partitionsWorkList.add(partition);
-                                offsetsWorkList.addLong(offset);
+                                pool.partitionsWorkList.add(partition);
+                                pool.offsetsWorkList.addLong(offset);
                             }
 
                             setRequestedOffset.accept(candidate.id, requestedOffset);
@@ -1566,20 +1577,20 @@ public final class NetworkConnectionPool
                     candidate = next;
                 }
 
-                if (!partitionsWorkList.isEmpty())
+                if (!pool.partitionsWorkList.isEmpty())
                 {
                     // Update the partition offsets. We must remove and add to preserve ordering.
-                    for (int i=0; i < partitionsWorkList.size(); i++)
+                    for (int i=0; i < pool.partitionsWorkList.size(); i++)
                     {
-                        NetworkTopicPartition partition = partitionsWorkList.get(i);
+                        NetworkTopicPartition partition = pool.partitionsWorkList.get(i);
                         boolean removed = topic.partitions.remove(partition);
                         assert removed;
-                        partition.offset = offsetsWorkList.getLong(i);
+                        partition.offset = pool.offsetsWorkList.getLong(i);
                         topic.partitions.add(partition);
                     }
 
-                    partitionsWorkList.clear();
-                    offsetsWorkList.clear();
+                    pool.partitionsWorkList.clear();
+                    pool.offsetsWorkList.clear();
                 }
             }
 
@@ -1589,15 +1600,17 @@ public final class NetworkConnectionPool
         @Override
         void removeConnection()
         {
-            NetworkConnectionPool.this.removeConnection(this);
+            pool.removeConnection(this);
         }
     }
 
-    private final class HistoricalFetchConnection extends AbstractFetchConnection
+    private static final class HistoricalFetchConnection extends AbstractFetchConnection
     {
-        private HistoricalFetchConnection(BrokerMetadata broker)
+        private HistoricalFetchConnection(
+            final NetworkConnectionPool pool,
+            BrokerMetadata broker)
         {
-            super(broker, routeCounters.historicalFetches);
+            super(pool, broker, pool.routeCounters.historicalFetches);
         }
 
         @Override
@@ -1609,11 +1622,11 @@ public final class NetworkConnectionPool
             int partitionCount = 0;
             int originalEncodeLimit = encodeLimit;
 
-            NetworkTopic topic = topicsByName.get(topicName);
+            NetworkTopic topic = pool.topicsByName.get(topicName);
             if (topic.needsHistorical())
             {
                 final int maxPartitionBytes = topic.maximumWritableBytes(false);
-                final TopicMetadata metadata = topicMetadataByName.get(topicName);
+                final TopicMetadata metadata = pool.topicMetadataByName.get(topicName);
 
                 if (maxPartitionBytes > 0 && metadata != null)
                 {
@@ -1632,9 +1645,9 @@ public final class NetworkConnectionPool
                                 partitionId < partition.id && nodeIdsByPartition[partition.id] == brokerId)
                         {
                             long offset = metadata.ensureOffsetInRange(partition.id, partition.offset);
-                            PartitionRequestFW partitionRequest = NetworkConnectionPool.this.partitionRequestRW
-                                .wrap(NetworkConnectionPool.this.encodeBuffer, encodeLimit,
-                                        NetworkConnectionPool.this.encodeBuffer.capacity())
+                            PartitionRequestFW partitionRequest = pool.partitionRequestRW
+                                .wrap(pool.encodeBuffer, encodeLimit,
+                                        pool.encodeBuffer.capacity())
                                 .partitionId(partition.id)
                                 .fetchOffset(offset)
                                 .maxBytes(maxPartitionBytes)
@@ -1647,7 +1660,7 @@ public final class NetworkConnectionPool
                                 topic.dispatcher.adjustOffset(partition.id, partition.offset, offset);
                                 partitions.remove();
                                 partition.offset = offset;
-                                partitionsWorkList.add(partition);
+                                pool.partitionsWorkList.add(partition);
                             }
                             setRequestedOffset.accept(partition.id,  partition.offset);
                             encodeLimit = partitionRequest.limit();
@@ -1656,17 +1669,17 @@ public final class NetworkConnectionPool
                         }
                     }
 
-                    if (!partitionsWorkList.isEmpty())
+                    if (!pool.partitionsWorkList.isEmpty())
                     {
-                        topic.partitions.addAll(partitionsWorkList);
-                        partitionsWorkList.clear();
+                        topic.partitions.addAll(pool.partitionsWorkList);
+                        pool.partitionsWorkList.clear();
                     }
 
                     partitionCount = topic.satisfyPartitionRequestsFromCache(
                             partitionCount,
                             getRequestedOffset,
                             setRequestedOffset,
-                            NetworkConnectionPool.this.encodeBuffer,
+                            pool.encodeBuffer,
                             originalEncodeLimit,
                             encodeLimit,
                             l -> encodeLimit = l);
@@ -1680,14 +1693,20 @@ public final class NetworkConnectionPool
         @Override
         void removeConnection()
         {
-            NetworkConnectionPool.this.removeConnection(this);
+            pool.removeConnection(this);
         }
     }
 
-    private final class MetadataConnection extends AbstractNetworkConnection
+    private static final class MetadataConnection extends AbstractNetworkConnection
     {
         TopicMetadata pendingTopicMetadata;
         MetadataRequestType pendingRequest = MetadataRequestType.METADATA;
+
+        MetadataConnection(
+                final NetworkConnectionPool pool)
+        {
+            super(pool);
+        }
 
         @Override
         void doRequestIfNeeded()
@@ -1696,7 +1715,7 @@ public final class NetworkConnectionPool
             if (nextRequestId == nextResponseId)
             {
                 if (pendingTopicMetadata == null &&
-                    ((topicMetadata = topicMetadataByName.values().stream()
+                    ((topicMetadata = pool.topicMetadataByName.values().stream()
                       .filter(m -> m.isGetRequired()).findFirst()).isPresent()))
                 {
                     pendingTopicMetadata = topicMetadata.get();
@@ -1723,10 +1742,10 @@ public final class NetworkConnectionPool
             if (networkRequestBudget > networkRequestPadding)
             {
                 final int encodeOffset = 0;
-                final MutableDirectBuffer buffer = NetworkConnectionPool.this.encodeBuffer;
+                final MutableDirectBuffer buffer = pool.encodeBuffer;
                 int encodeLimit = encodeOffset;
 
-                RequestHeaderFW request = requestRW.wrap(
+                RequestHeaderFW request = pool.requestRW.wrap(
                         buffer, encodeLimit, buffer.capacity())
                         .size(0)
                         .apiKey(DESCRIBE_CONFIGS_API_KEY)
@@ -1737,14 +1756,14 @@ public final class NetworkConnectionPool
 
                 encodeLimit = request.limit();
 
-                DescribeConfigsRequestFW describeRequest = describeConfigsRequestRW.wrap(
+                DescribeConfigsRequestFW describeRequest = pool.describeConfigsRequestRW.wrap(
                         buffer, encodeLimit, buffer.capacity())
                         .resourceCount(1)
                         .build();
 
                 encodeLimit = describeRequest.limit();
 
-                ResourceRequestFW resourceRequest = resourceRequestRW.wrap(
+                ResourceRequestFW resourceRequest = pool.resourceRequestRW.wrap(
                         buffer, encodeLimit, buffer.capacity())
                         .type(RESOURCE_TYPE_TOPIC)
                         .name(pendingTopicMetadata.topicName)
@@ -1753,14 +1772,14 @@ public final class NetworkConnectionPool
 
                 encodeLimit = resourceRequest.limit();
 
-                String16FW configName = configNameRW.wrap(
+                String16FW configName = pool.configNameRW.wrap(
                         buffer, encodeLimit, buffer.capacity())
                         .set(CLEANUP_POLICY, UTF_8)
                         .build();
 
                 encodeLimit = configName.limit();
 
-                configName = configNameRW.wrap(
+                configName = pool.configNameRW.wrap(
                         buffer, encodeLimit, buffer.capacity())
                         .set(DELETE_RETENTION_MS, UTF_8)
                         .build();
@@ -1772,7 +1791,7 @@ public final class NetworkConnectionPool
                 {
                     int newCorrelationId = nextRequestId++;
 
-                    NetworkConnectionPool.this.requestRW
+                    pool.requestRW
                              .wrap(buffer, request.offset(), request.limit())
                              .size(encodeLimit - encodeOffset - RequestHeaderFW.FIELD_OFFSET_API_KEY)
                              .apiKey(DESCRIBE_CONFIGS_API_KEY)
@@ -1781,18 +1800,19 @@ public final class NetworkConnectionPool
                              .clientId((String) null)
                              .build();
 
-                    OctetsFW payload = NetworkConnectionPool.this.payloadRW
+                    OctetsFW payload = pool.payloadRW
                             .wrap(buffer, encodeOffset, encodeLimit)
                             .set((b, o, m) -> m - o)
                             .build();
 
-                    NetworkConnectionPool.this.clientStreamFactory.doData(networkTarget, networkId,
+                    clientStreamFactory.doData(networkTarget, networkId,
                             networkRequestPadding, payload);
                     networkRequestBudget -= payload.sizeof() + networkRequestPadding;
                     pendingRequest = MetadataRequestType.DESCRIBE_CONFIGS;
 
                     timer.cancel();
-                    clientStreamFactory.scheduler.rescheduleTimeout(readIdleTimeout, timer, this::describeConfigsRequestIdle);
+                    clientStreamFactory.scheduler.rescheduleTimeout(pool.readIdleTimeout, timer,
+                            this::describeConfigsRequestIdle);
                 }
             }
         }
@@ -1806,9 +1826,9 @@ public final class NetworkConnectionPool
                 final int encodeOffset = 0;
                 int encodeLimit = encodeOffset;
 
-                RequestHeaderFW request = requestRW.wrap(
-                        NetworkConnectionPool.this.encodeBuffer, encodeLimit,
-                        NetworkConnectionPool.this.encodeBuffer.capacity())
+                RequestHeaderFW request = pool.requestRW.wrap(
+                        pool.encodeBuffer, encodeLimit,
+                        pool.encodeBuffer.capacity())
                         .size(0)
                         .apiKey(METADATA_API_KEY)
                         .apiVersion(METADATA_API_VERSION)
@@ -1818,9 +1838,9 @@ public final class NetworkConnectionPool
 
                 encodeLimit = request.limit();
 
-                MetadataRequestFW metadataRequest = metadataRequestRW.wrap(
-                        NetworkConnectionPool.this.encodeBuffer, encodeLimit,
-                        NetworkConnectionPool.this.encodeBuffer.capacity())
+                MetadataRequestFW metadataRequest = pool.metadataRequestRW.wrap(
+                        pool.encodeBuffer, encodeLimit,
+                        pool.encodeBuffer.capacity())
                         .topicCount(1)
                         .topicName(pendingTopicMetadata.topicName)
                         .build();
@@ -1832,8 +1852,8 @@ public final class NetworkConnectionPool
                 {
                     int newCorrelationId = nextRequestId++;
 
-                    NetworkConnectionPool.this.requestRW
-                             .wrap(NetworkConnectionPool.this.encodeBuffer, request.offset(), request.limit())
+                    pool.requestRW
+                             .wrap(pool.encodeBuffer, request.offset(), request.limit())
                              .size(encodeLimit - encodeOffset - RequestHeaderFW.FIELD_OFFSET_API_KEY)
                              .apiKey(METADATA_API_KEY)
                              .apiVersion(METADATA_API_VERSION)
@@ -1841,18 +1861,19 @@ public final class NetworkConnectionPool
                              .clientId((String) null)
                              .build();
 
-                    OctetsFW payload = NetworkConnectionPool.this.payloadRW
-                            .wrap(NetworkConnectionPool.this.encodeBuffer, encodeOffset, encodeLimit)
+                    OctetsFW payload = pool.payloadRW
+                            .wrap(pool.encodeBuffer, encodeOffset, encodeLimit)
                             .set((b, o, m) -> m - o)
                             .build();
 
-                    NetworkConnectionPool.this.clientStreamFactory.doData(networkTarget, networkId,
+                    clientStreamFactory.doData(networkTarget, networkId,
                             networkRequestPadding, payload);
                     networkRequestBudget -= payload.sizeof() + networkRequestPadding;
                     pendingRequest = MetadataRequestType.METADATA;
 
                     timer.cancel();
-                    clientStreamFactory.scheduler.rescheduleTimeout(readIdleTimeout, timer, this::metadataRequestIdle);
+                    clientStreamFactory.scheduler.rescheduleTimeout(
+                            pool.readIdleTimeout, timer, this::metadataRequestIdle);
                 }
             }
         }
@@ -1884,7 +1905,7 @@ public final class NetworkConnectionPool
             timer.cancel();
 
             final DescribeConfigsResponseFW describeConfigsResponse =
-                    describeConfigsResponseRO.tryWrap(networkBuffer, networkOffset, networkLimit);
+                    pool.describeConfigsResponseRO.tryWrap(networkBuffer, networkOffset, networkLimit);
 
             KafkaError error = NONE;
             boolean compacted = false;
@@ -1902,7 +1923,8 @@ public final class NetworkConnectionPool
                 loop:
                 for (int resourceIndex = 0; resourceIndex < resourceCount && error == NONE; resourceIndex++)
                 {
-                    final ResourceResponseFW resource = resourceResponseRO.tryWrap(networkBuffer, networkOffset, networkLimit);
+                    final ResourceResponseFW resource = pool.resourceResponseRO.tryWrap(
+                            networkBuffer, networkOffset, networkLimit);
                     if (resource == null)
                     {
                         error = UNEXPECTED_SERVER_ERROR;
@@ -1922,7 +1944,7 @@ public final class NetworkConnectionPool
                     for (int configIndex = 0; configIndex < configCount && error == NONE; configIndex++)
                     {
                         final ConfigResponseFW configResponse =
-                                configResponseRO.tryWrap(networkBuffer, networkOffset, networkLimit);
+                                pool.configResponseRO.tryWrap(networkBuffer, networkOffset, networkLimit);
                         if (configResponse == null)
                         {
                             error = UNEXPECTED_SERVER_ERROR;
@@ -1951,8 +1973,8 @@ public final class NetworkConnectionPool
             {
                 pendingTopicMetadata.scheduleRefresh(
                         clientStreamFactory.scheduler,
-                        metadataBackoffMillis,
-                        metadataConnection);
+                        pool.metadataBackoffMillis,
+                        pool.metadataConnection);
                 pendingTopicMetadata = null;
             }
             else if (error != NONE)
@@ -1976,7 +1998,7 @@ public final class NetworkConnectionPool
                     {
                     case UNKNOWN_TOPIC_OR_PARTITION:
                         // Topic was re-created, force clients to re-attach at offset zero
-                        NetworkTopic topic = topicsByName.get(metadata.topicName);
+                        NetworkTopic topic = pool.topicsByName.get(metadata.topicName);
                         if (topic != null)
                         {
                             topic.dispatcher.detach(true);
@@ -2023,8 +2045,8 @@ public final class NetworkConnectionPool
                     }
                     topicMetadata.scheduleRefresh(
                             clientStreamFactory.scheduler,
-                            metadataBackoffMillis,
-                            metadataConnection);
+                            pool.metadataBackoffMillis,
+                            pool.metadataConnection);
                 }
                 pendingTopicMetadata = null;
                 break;
@@ -2037,8 +2059,8 @@ public final class NetworkConnectionPool
                 detachSubscribers(topicName, false);
                 topicMetadata.setErrorCode(error);
                 topicMetadata.flush();
-                topicsByName.remove(topicName);
-                topicMetadataByName.remove(topicName);
+                pool.topicsByName.remove(topicName);
+                pool.topicMetadataByName.remove(topicName);
                 pendingTopicMetadata = null;
                 break;
             default:
@@ -2054,7 +2076,8 @@ public final class NetworkConnectionPool
             int networkOffset,
             int networkLimit)
         {
-            final MetadataResponseFW metadataResponse = metadataResponseRO.tryWrap(networkBuffer, networkOffset, networkLimit);
+            final MetadataResponseFW metadataResponse = pool.metadataResponseRO.tryWrap(
+                    networkBuffer, networkOffset, networkLimit);
             if (metadataResponse == null)
             {
                 return UNEXPECTED_SERVER_ERROR;
@@ -2066,7 +2089,7 @@ public final class NetworkConnectionPool
             KafkaError error = NONE;
             for (int brokerIndex=0; brokerIndex < brokerCount; brokerIndex++)
             {
-                final BrokerMetadataFW broker = brokerMetadataRO.tryWrap(networkBuffer, networkOffset, networkLimit);
+                final BrokerMetadataFW broker = pool.brokerMetadataRO.tryWrap(networkBuffer, networkOffset, networkLimit);
                 if (broker == null)
                 {
                     return UNEXPECTED_SERVER_ERROR;
@@ -2077,7 +2100,7 @@ public final class NetworkConnectionPool
             }
 
             final MetadataResponsePart2FW metadataResponsePart2 =
-                    metadataResponsePart2RO.tryWrap(networkBuffer, networkOffset, networkLimit);
+                    pool.metadataResponsePart2RO.tryWrap(networkBuffer, networkOffset, networkLimit);
             if (metadataResponsePart2 == null)
             {
                 return UNEXPECTED_SERVER_ERROR;
@@ -2088,7 +2111,7 @@ public final class NetworkConnectionPool
             networkOffset = metadataResponsePart2.limit();
             for (int topicIndex = 0; topicIndex < topicCount && error == NONE; topicIndex++)
             {
-                final TopicMetadataFW topicMetadata = topicMetadataRO.tryWrap(networkBuffer, networkOffset, networkLimit);
+                final TopicMetadataFW topicMetadata = pool.topicMetadataRO.tryWrap(networkBuffer, networkOffset, networkLimit);
                 if (topicMetadata == null)
                 {
                     return UNEXPECTED_SERVER_ERROR;
@@ -2109,7 +2132,7 @@ public final class NetworkConnectionPool
                     for (int partitionIndex = 0; partitionIndex < partitionCount && error == NONE; partitionIndex++)
                     {
                         final PartitionMetadataFW partition =
-                                partitionMetadataRO.tryWrap(networkBuffer, networkOffset, networkLimit);
+                                pool.partitionMetadataRO.tryWrap(networkBuffer, networkOffset, networkLimit);
                         if (partition == null)
                         {
                             return UNEXPECTED_SERVER_ERROR;
@@ -2133,7 +2156,7 @@ public final class NetworkConnectionPool
             String topicName,
             boolean reattach)
         {
-            NetworkTopic topic = topicsByName.get(topicName);
+            NetworkTopic topic = pool.topicsByName.get(topicName);
             if (topic != null)
             {
                 topic.dispatcher.detach(reattach);
