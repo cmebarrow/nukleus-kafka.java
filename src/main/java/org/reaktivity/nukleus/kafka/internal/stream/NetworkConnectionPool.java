@@ -680,6 +680,13 @@ public final class NetworkConnectionPool
                 this.networkId = 0L;
                 this.networkRequestBudget = 0;
             }
+
+            // ensure we do not attempt to process any outstanding response
+            if (networkReplyId != 0L)
+            {
+                clientStreamFactory.doReset(networkReplyThrottle, networkReplyId);
+                this.networkReplyId = 0L;
+            }
         }
 
         final void close()
