@@ -106,6 +106,7 @@ import org.reaktivity.nukleus.kafka.internal.types.stream.AbortFW;
 import org.reaktivity.nukleus.kafka.internal.types.stream.BeginFW;
 import org.reaktivity.nukleus.kafka.internal.types.stream.DataFW;
 import org.reaktivity.nukleus.kafka.internal.types.stream.EndFW;
+import org.reaktivity.nukleus.kafka.internal.types.stream.FrameFW;
 import org.reaktivity.nukleus.kafka.internal.types.stream.ResetFW;
 import org.reaktivity.nukleus.kafka.internal.types.stream.TcpBeginExFW;
 import org.reaktivity.nukleus.kafka.internal.types.stream.WindowFW;
@@ -550,6 +551,11 @@ public final class NetworkConnectionPool
         }
     }
 
+    KafkaRefCounters getRouteCounters()
+    {
+        return routeCounters;
+    }
+
     void removeConnection(LiveFetchConnection connection)
     {
         connections = ArrayUtil.remove(connections, connection);
@@ -779,6 +785,14 @@ public final class NetworkConnectionPool
             int index,
             int length)
         {
+            final FrameFW frame = clientStreamFactory.frameRO.wrap(buffer, index, index + length);
+            if (frame.streamId() != networkReplyId)
+            {
+                // reject deferred DATA / END / ABORT after idle ABORT without RESET
+                clientStreamFactory.doReset(networkReplyThrottle, networkReplyId);
+                return;
+            }
+
             switch (msgTypeId)
             {
             case DataFW.TYPE_ID:
@@ -2659,7 +2673,15 @@ public final class NetworkConnectionPool
             DirectBuffer result = null;
             if (wrapped != null)
             {
-                wrapper.wrap(wrapped.buffer(), wrapped.offset(), wrapped.sizeof());
+                final int wrappedLength = wrapped.sizeof();
+                if (wrappedLength == 0)
+                {
+                    wrapper.wrap(EMPTY_BYTE_ARRAY);
+                }
+                else
+                {
+                    wrapper.wrap(wrapped.buffer(), wrapped.offset(), wrappedLength);
+                }
                 result = wrapper;
             }
             return result;

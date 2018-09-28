@@ -1014,6 +1014,32 @@ public class FetchIT
     @Test
     @Specification({
         "${route}/client/controller",
+        "${client}/gzip.compressed.record.batch/client",
+        "${server}/gzip.compressed.record.batch/server" })
+    @ScriptProperty("networkAccept \"nukleus://target/streams/kafka\"")
+    public void shouldSkipGzipCompressedRecordBatch() throws Exception
+    {
+        k3po.start();
+        k3po.notifyBarrier("WRITE_FETCH_RESPONSE");
+        k3po.finish();
+    }
+
+    @Test
+    @Specification({
+        "${route}/client/controller",
+        "${client}/snappy.compressed.record.batch/client",
+        "${server}/snappy.compressed.record.batch/server" })
+    @ScriptProperty("networkAccept \"nukleus://target/streams/kafka\"")
+    public void shouldSkipSnappyCompressedRecordBatch() throws Exception
+    {
+        k3po.start();
+        k3po.notifyBarrier("WRITE_FETCH_RESPONSE");
+        k3po.finish();
+    }
+
+    @Test
+    @Specification({
+        "${route}/client/controller",
         "${client}/zero.offset.message/client",
         "${server}/zero.offset.message.topic.not.found.initially/server" })
     @ScriptProperty("networkAccept \"nukleus://target/streams/kafka\"")
@@ -1050,8 +1076,10 @@ public class FetchIT
     public void shouldHandleResetFromClientWithoutCausingNPEInDoFetchRequest() throws Exception
     {
         k3po.start();
-        k3po.awaitBarrier("DESCRIBE_CONFIGS_REQUEST_RECEIVED");
+        k3po.awaitBarrier("KNOWN_TOPIC_METADATA_REQUEST_RECEIVED");
         k3po.notifyBarrier("DO_RESET");
+        k3po.awaitBarrier("CONNECT_CLIENT_TWO");
+        k3po.notifyBarrier("SEND_METADATA_RESPONSE");
         k3po.finish();
     }
 
