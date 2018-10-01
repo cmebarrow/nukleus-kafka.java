@@ -1287,7 +1287,9 @@ public final class NetworkConnectionPool
                 if (excessBytes >= 0) // response complete
                 {
                     timer.cancel();
-                    assert excessBytes == 0 : "bytes remaining after fetch response, pipelined requests are not being used";
+                    assert excessBytes == 0 :
+                        format("%s: %d bytes remaining after fetch response, pipelined requests are not being used",
+                                this, excessBytes);
                     nextResponseId++;
                     doRequestIfNeeded();
                 }
@@ -1502,9 +1504,9 @@ public final class NetworkConnectionPool
         public String toString()
         {
             return format("%s [brokerId=%d, host=%s, port=%d, budget=%d, padding=%d, networkId=%d, networkReplyId=%d," +
-                          "nextRequestId=%d, nextResponseId=%d]",
+                          "nextRequestId=%d, nextResponseId=%d, fetchResponseDecoder=%s]",
                     getClass().getSimpleName(), brokerId, host, port, networkRequestBudget, networkRequestPadding,
-                    networkId, networkReplyId, nextRequestId, nextResponseId);
+                    networkId, networkReplyId, nextRequestId, nextResponseId, fetchResponseDecoder);
         }
     }
 

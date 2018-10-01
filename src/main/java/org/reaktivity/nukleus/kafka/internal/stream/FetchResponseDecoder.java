@@ -15,6 +15,7 @@
  */
 package org.reaktivity.nukleus.kafka.internal.stream;
 
+import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 import static org.agrona.LangUtil.rethrowUnchecked;
 import static org.reaktivity.nukleus.kafka.internal.stream.KafkaError.NONE;
@@ -184,6 +185,20 @@ public class FetchResponseDecoder implements ResponseDecoder
         topicCount = 0;
         partitionCount = 0;
         decoderState = this::decodeResponseHeader;
+    }
+
+    @Override
+    public String toString()
+    {
+        return format(
+           "(topicName=%d, partition=%d, errorCode=%d, highWatermark=%d, firstOffset=%d, lastOffsetDelta=%d, firstTimestamp=%d)",
+            topicName,
+            partition,
+            errorCode,
+            highWatermark,
+            firstOffset,
+            lastOffsetDelta,
+            firstTimestamp);
     }
 
     private int appendToSlot(DirectBuffer source, int offset, int limit)
