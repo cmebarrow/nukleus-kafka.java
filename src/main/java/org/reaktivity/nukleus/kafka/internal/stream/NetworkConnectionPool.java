@@ -49,6 +49,7 @@ import java.util.function.IntConsumer;
 import java.util.function.IntSupplier;
 import java.util.function.IntToLongFunction;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 import org.agrona.DirectBuffer;
 import org.agrona.MutableDirectBuffer;
@@ -143,6 +144,13 @@ public final class NetworkConnectionPool
 
     private static final DecoderMessageDispatcher NOOP_DISPATCHER = new DecoderMessageDispatcher()
     {
+        @Override
+        public void startOffset(
+            int partition,
+            long lowWatermark)
+        {
+        }
+
         @Override
         public int dispatch(
             int partition,
@@ -483,25 +491,40 @@ public final class NetworkConnectionPool
         BiFunction<NetworkConnectionPool, BrokerMetadata, T> createConnection)
     {
         T[] result = connections;
-        AbstractFetchConnection current = null;
+        T current = null;
+        T available = null;
         for (int i = 0; i < connections.length; i++)
         {
-            AbstractFetchConnection connection = connections[i];
-            if (connection.brokerId == broker.nodeId)
+            T connection = connections[i];
+            if (connection.broker == null)
+            {
+                available = connection;
+            }
+            else if (connection.broker.nodeId == broker.nodeId)
             {
                 current = connection;
-                if (!connection.host.equals(broker.host) || connection.port != broker.port)
+                if (!connection.broker.equals(broker))
                 {
-                    // Change in cluster configuration
-                    connection.close();
-                    current = createConnection.apply(this, broker);
+                    // Cluster node has moved to a new host or port
+                    current.close();
+                    current.doReinitialize();
+                    current.setBroker(broker);
                 }
                 break;
             }
         }
         if (current == null)
         {
-            result = ArrayUtil.add(connections, createConnection.apply(this, broker));
+            if (available != null)
+            {
+                current = available;
+            }
+            else
+            {
+                current = createConnection.apply(this, broker);
+                result = ArrayUtil.add(connections, current);
+            }
+            current.setBroker(broker);
         }
         return result;
     }
@@ -608,7 +631,7 @@ public final class NetworkConnectionPool
         @Override
         public String toString()
         {
-            return format("%s [budget=%d, padding=%d, networkId=%d, networkReplyId=%d, nextRequestId %d, nextResponseId %d]",
+            return format("%s [budget=%d, padding=%d, networkId=%x, networkReplyId=%x, nextRequestId %d, nextResponseId %d]",
                     getClass().getSimpleName(), networkRequestBudget, networkRequestPadding,
                     networkId, networkReplyId, nextRequestId, nextResponseId);
         }
@@ -789,7 +812,7 @@ public final class NetworkConnectionPool
             if (frame.streamId() != networkReplyId)
             {
                 // reject deferred DATA / END / ABORT after idle ABORT without RESET
-                clientStreamFactory.doReset(networkReplyThrottle, networkReplyId);
+                clientStreamFactory.doReset(networkReplyThrottle, frame.streamId());
                 return;
             }
 
@@ -997,6 +1020,7 @@ public final class NetworkConnectionPool
             networkReplyId = 0L;
             nextRequestId = 0;
             nextResponseId = 0;
+            streamState = this::beforeBegin;
         }
     }
 
@@ -1005,9 +1029,7 @@ public final class NetworkConnectionPool
         private static final long EARLIEST_AVAILABLE_OFFSET = -2L;
         private static final long NEXT_OFFSET = -1L; // high water mark (offset of the next published message)
 
-        final String host;
-        final int port;
-        final int brokerId;
+        BrokerMetadata broker;
 
         int encodeLimit;
         boolean offsetsNeeded;
@@ -1030,6 +1052,7 @@ public final class NetworkConnectionPool
             fetchResponseDecoder = new FetchResponseDecoder(
                     this::getTopicDispatcher,
                     this::getRequestedOffset,
+                    this::updateStartOffset,
                     this::handlePartitionResponseError,
                     localDecodeBuffer);
         }
@@ -1037,15 +1060,15 @@ public final class NetworkConnectionPool
         @Override
         void doRequestIfNeeded()
         {
-            if (nextRequestId == nextResponseId)
+            if (nextRequestId == nextResponseId && broker != null)
             {
                 doBeginIfNotConnected((b, o, m) ->
                 {
                     return pool.tcpBeginExRW.wrap(b, o, m)
                             .localAddress(lab -> lab.ipv4Address(ob -> ob.put(ANY_IP_ADDR)))
                                       .localPort(0)
-                                      .remoteAddress(rab -> rab.host(host))
-                                      .remotePort(port)
+                                      .remoteAddress(rab -> rab.host(broker.host))
+                                      .remotePort(broker.port)
                                       .limit();
                 });
 
@@ -1199,7 +1222,7 @@ public final class NetworkConnectionPool
 
             for (TopicMetadata topicMetadata : pool.topicMetadataByName.values())
             {
-                int partitionCount = topicMetadata.offsetsRequired(brokerId);
+                int partitionCount = topicMetadata.offsetsRequired(broker.nodeId);
                 if (partitionCount > 0)
                 {
                     topicCount++;
@@ -1214,7 +1237,7 @@ public final class NetworkConnectionPool
 
                     for (int partitionId=0; partitionId <  topicMetadata.nodeIdsByPartition.length; partitionId++)
                     {
-                        if (topicMetadata.nodeIdsByPartition[partitionId] == brokerId &&
+                        if (topicMetadata.nodeIdsByPartition[partitionId] == broker.nodeId &&
                             topicMetadata.offsetsOutOfRangeByPartition[partitionId] != NO_OFFSET)
                         {
                             long requestedTimestamp = topicMetadata.offsetsOutOfRangeByPartition[partitionId] == MAX_OFFSET
@@ -1418,6 +1441,15 @@ public final class NetworkConnectionPool
             return requestedFetchOffsetsByTopic.get(topicName)[partitionId];
         }
 
+        final long updateStartOffset(
+            String topicName,
+            int partitionId,
+            long startOffset)
+        {
+            final TopicMetadata topicMetadata = topicMetadataByName.get(topicName);
+            return topicMetadata != null ? topicMetadata.tryAdvanceFirstOffset(partitionId, startOffset) : 0L;
+        }
+
         @Override
         void doReinitialize()
         {
@@ -1426,25 +1458,30 @@ public final class NetworkConnectionPool
         }
 
         @Override
-        void handleConnectionFailed()
+        final void handleConnectionFailed()
         {
             invalidateConnectionMetadata();
-            removeConnection();
+            doReinitialize();
             pool.metadataConnection.doRequestIfNeeded();
         }
 
-        abstract void removeConnection();
+        void setBroker(
+            BrokerMetadata broker)
+        {
+            this.broker = broker;
+        }
 
         private void invalidateConnectionMetadata()
         {
             for (TopicMetadata metadata : pool.topicMetadataByName.values())
             {
-                if (metadata.invalidateBroker(brokerId))
+                if (metadata.invalidateBroker(broker.nodeId))
                 {
                     int newAttachId = pool.nextAttachId++;
                     metadata.doAttach(newAttachId, this::metadataUpdated);
                 }
             }
+            broker = null;
         }
 
         private void metadataUpdated(TopicMetadata metadata)
@@ -1510,9 +1547,9 @@ public final class NetworkConnectionPool
         @Override
         public String toString()
         {
-            return format("%s [brokerId=%d, host=%s, port=%d, budget=%d, padding=%d, networkId=%d, networkReplyId=%d," +
+            return format("%s [broker=%s, budget=%d, padding=%d, networkId=%x, networkReplyId=%x," +
                           "nextRequestId=%d, nextResponseId=%d]",
-                    getClass().getSimpleName(), brokerId, host, port, networkRequestBudget, networkRequestPadding,
+                    getClass().getSimpleName(), broker, networkRequestBudget, networkRequestPadding,
                     networkId, networkReplyId, nextRequestId, nextResponseId);
         }
     }
@@ -1552,7 +1589,7 @@ public final class NetworkConnectionPool
                     next = iterator.hasNext() ? iterator.next() : null;
                     boolean isHighestOffset = next == null || next.id != candidate.id;
 
-                    if (isHighestOffset && nodeIdsByPartition[candidate.id] == brokerId)
+                    if (isHighestOffset && nodeIdsByPartition[candidate.id] == broker.nodeId)
                     {
                         if (candidate.offset == MAX_OFFSET)
                         {
@@ -1610,12 +1647,6 @@ public final class NetworkConnectionPool
 
             return partitionCount;
         }
-
-        @Override
-        void removeConnection()
-        {
-            pool.removeConnection(this);
-        }
     }
 
     private static final class HistoricalFetchConnection extends AbstractFetchConnection
@@ -1656,7 +1687,7 @@ public final class NetworkConnectionPool
                         NetworkTopicPartition partition = partitions.next();
 
                         if (topic.needsHistorical(partition.id) &&
-                                partitionId < partition.id && nodeIdsByPartition[partition.id] == brokerId)
+                                partitionId < partition.id && nodeIdsByPartition[partition.id] == broker.nodeId)
                         {
                             long offset = metadata.ensureOffsetInRange(partition.id, partition.offset);
                             PartitionRequestFW partitionRequest = pool.partitionRequestRW
@@ -1702,12 +1733,6 @@ public final class NetworkConnectionPool
             }
 
             return partitionCount;
-        }
-
-        @Override
-        void removeConnection()
-        {
-            pool.removeConnection(this);
         }
     }
 
@@ -2778,6 +2803,33 @@ public final class NetworkConnectionPool
             this.host = host;
             this.port = port;
         }
+
+        @Override
+        public boolean equals(
+            Object obj)
+        {
+            BrokerMetadata that;
+            return (this == obj ||
+                    (this != null &&
+                    obj instanceof BrokerMetadata &&
+                    this.nodeId == (that = (BrokerMetadata) obj).nodeId &&
+                    this.nodeId == that.nodeId &&
+                    this.host.equals(that.host) &&
+                    this.port == that.port)
+                    );
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return super.hashCode();
+        }
+
+        @Override
+        public String toString()
+        {
+            return format("(nodeId=%d, host=%s, port=%d)", nodeId, host, port);
+        }
     }
 
     private static final class TopicMetadata
@@ -3000,6 +3052,16 @@ public final class NetworkConnectionPool
         void setFirstOffset(int partitionId, long offset)
         {
             firstOffsetsByPartition[partitionId] = offset;
+        }
+
+        long tryAdvanceFirstOffset(int partitionId, long startOffset)
+        {
+            final long earliestOffset = firstOffsetsByPartition != null ? firstOffsetsByPartition[partitionId] : 0L;
+            if (startOffset > earliestOffset)
+            {
+                firstOffsetsByPartition[partitionId] = startOffset;
+            }
+            return earliestOffset;
         }
 
         public void setOffsetOutOfRange(
