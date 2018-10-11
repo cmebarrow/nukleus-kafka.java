@@ -59,12 +59,26 @@ public class CachingFetchLimitsIT
     @Specification({
         "${route}/client/controller",
         "${client}/compacted.historical.large.message.subscribed.to.key/client",
-        "${server}/compacted.messages.first.exceeds.256.bytes.repeated/server"})
+        "${server}/compacted.messages.large.and.small.repeated/server"})
     @ScriptProperty({
         "networkAccept \"nukleus://target/streams/kafka\"",
         "applicationConnectWindow \"200\""
     })
     public void shouldReceiveCompactedFragmentedMessageFromCacheWhenSubscribedToKey() throws Exception
+    {
+        k3po.finish();
+    }
+
+    @Test
+    @Specification({
+        "${route}/client/controller",
+        "${client}/compacted.historical.large.message.subscribed.to.key/client",
+        "${server}/compacted.messages.large.and.small.repeated/server"})
+    @ScriptProperty({
+        "networkAccept \"nukleus://target/streams/kafka\"",
+        "applicationConnectWindow \"200\""
+    })
+    public void shouldReceiveCompactedFragmentedMessageThenSmallMessageFromCacheWhenSubscribedToKey() throws Exception
     {
         k3po.finish();
     }

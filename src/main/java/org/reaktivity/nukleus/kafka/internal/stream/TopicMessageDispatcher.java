@@ -15,8 +15,6 @@
  */
 package org.reaktivity.nukleus.kafka.internal.stream;
 
-import static java.lang.String.format;
-
 import java.util.Iterator;
 import java.util.function.Function;
 
@@ -49,6 +47,14 @@ public class TopicMessageDispatcher implements MessageDispatcher, DecoderMessage
             keys[partition] = new KeyMessageDispatcher(createHeaderValueMessageDispatcher);
         }
         headers = new HeadersMessageDispatcher(createHeaderValueMessageDispatcher);
+    }
+
+    @Override
+    public void startOffset(
+        int partition,
+        long startOffset)
+    {
+        indexes[partition].startOffset(startOffset);
     }
 
     @Override
@@ -91,21 +97,22 @@ public class TopicMessageDispatcher implements MessageDispatcher, DecoderMessage
     {
         int result = dispatch(partition, requestOffset, messageOffset, key, headers.headerSupplier(), timestamp,
                 traceId, value);
+
         if (messageOffset + 1 == highWatermark)
         {
             // Caught up to live stream, enable pro-active message caching
             if (!cacheNewMessages[partition])
             {
-                System.out.println(format("Caught up to live stream, partition %d highWatermark %d",
-                        partition, highWatermark));
                 cacheNewMessages[partition] = true;
             }
         }
+
         if (MessageDispatcher.matched(result))
         {
             indexes[partition].add(requestOffset, messageOffset, timestamp, traceId, key, headers, value,
                     cacheNewMessages[partition]);
         }
+
         return result;
     }
 

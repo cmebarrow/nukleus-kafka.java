@@ -64,7 +64,7 @@ public class FetchLimitsIT
     @Specification({
         "${route}/client/controller",
         "${client}/compacted.large.message.subscribed.to.key/client",
-        "${server}/compacted.messages.first.exceeds.256.bytes/server"})
+        "${server}/compacted.messages.large.and.small/server"})
     @ScriptProperty("networkAccept \"nukleus://target/streams/kafka\"")
     public void shouldReceiveLargeCompactedMessageWhenSubscribedToKey() throws Exception
     {
@@ -75,7 +75,7 @@ public class FetchLimitsIT
     @Specification({
         "${route}/client/controller",
         "${client}/compacted.large.message.subscribed.to.key/client",
-        "${server}/compacted.messages.first.exceeds.256.bytes.repeated/server"})
+        "${server}/compacted.messages.large.and.small.repeated/server"})
     @ScriptProperty({
         "networkAccept \"nukleus://target/streams/kafka\"",
         "applicationConnectWindow \"200\""
@@ -88,8 +88,37 @@ public class FetchLimitsIT
     @Test
     @Specification({
         "${route}/client/controller",
-        "${client}/zero.offset.large.message/client",
-        "${server}/zero.offset.messages.first.exceeds.256.bytes/server"})
+        "${client}/zero.offset.partial.message.aborted/client",
+        "${server}/zero.offset.messages.large.and.small.then.large.missing/server"})
+    @ScriptProperty("networkAccept \"nukleus://target/streams/kafka\"")
+    public void shouldBeDetachedWhenPartiallyDeliveredMessageNoLongerAvailable() throws Exception
+    {
+        k3po.finish();
+    }
+
+    @Test
+    @Specification({
+        "${route}/client/controller",
+        "${client}/zero.offset.messages.large.and.small.fanout/client",
+        "${server}/zero.offset.messages.large.and.small.historical/server"})
+    @ScriptProperty({
+        "networkAccept \"nukleus://target/streams/kafka\"",
+        "applicationConnectWindow \"200\""
+    })
+    public void shouldNotDettachWhenDispatchingLiveMessageWhenHistoricalMessageIsPartiallyWritten()
+            throws Exception
+    {
+        k3po.start();
+        k3po.awaitBarrier("LIVE_FETCH_REQUEST_ONE_RECEIVED");
+        k3po.notifyBarrier("CONNECT_CLIENT_TWO");
+        k3po.finish();
+    }
+
+    @Test
+    @Specification({
+        "${route}/client/controller",
+        "${client}/zero.offset.messages.large.and.small/client",
+        "${server}/zero.offset.messages.large.and.small/server"})
     @ScriptProperty("networkAccept \"nukleus://target/streams/kafka\"")
     public void shouldReceiveMessageExceedingBufferSlotCapacity() throws Exception
     {
@@ -99,8 +128,8 @@ public class FetchLimitsIT
     @Test
     @Specification({
         "${route}/client/controller",
-        "${client}/zero.offset.large.message/client",
-        "${server}/zero.offset.messages.first.exceeds.256.bytes.repeated/server"})
+        "${client}/zero.offset.messages.large.and.small/client",
+        "${server}/zero.offset.messages.large.and.small.repeated/server"})
     @ScriptProperty({
         "networkAccept \"nukleus://target/streams/kafka\"",
         "applicationConnectWindow \"200\""
@@ -113,7 +142,7 @@ public class FetchLimitsIT
     @Test
     @Specification({
         "${route}/client/controller",
-        "${client}/zero.offset.large.message/client",
+        "${client}/zero.offset.messages.large.and.small/client",
         "${server}/zero.offset.first.record.batch.large.requires.3.fetches/server"})
     @ScriptProperty({
         "networkAccept \"nukleus://target/streams/kafka\"",
