@@ -505,12 +505,11 @@ public final class NetworkConnectionPool
         if (metadata != null)
         {
             metadata.doDetach(attachId);
-            if (!metadata.hasConsumers())
+            NetworkTopic topic = topicsByName.get(topicName);
+            if (!metadata.hasConsumers() && topic != null && topic.partitions.isEmpty())
             {
-                metadata = topicMetadataByName.remove(topicName);
-                NetworkTopic topic = topicsByName.remove(topicName);
-                System.out.format("NCP.doDetach: removed metadata %s, topic %s !!!\n",
-                        metadata, topic);
+                topicMetadataByName.remove(topicName);
+                topicsByName.remove(topicName);
             }
         }
     }

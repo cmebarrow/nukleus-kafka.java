@@ -628,10 +628,9 @@ public final class ClientStreamFactory implements StreamFactory
             boolean reattach)
         {
             progressHandler = NOOP_PROGRESS_HANDLER;
-            if (detacher != null && attacher == null)
+            if (detacher != null && dispatchState == dispatchFromPoolState)
             {
                 invoke(detacher);
-                detacher = null;
             }
             else
             {
