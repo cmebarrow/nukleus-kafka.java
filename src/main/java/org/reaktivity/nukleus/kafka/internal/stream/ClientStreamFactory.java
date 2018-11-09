@@ -613,6 +613,9 @@ public final class ClientStreamFactory implements StreamFactory
             long oldOffset,
             long newOffset)
         {
+            System.out.format("CAS.adjustOffset: partition=%d, oldOffset = %d, newOffset = %d, this = %s\n",
+                    partition, oldOffset, newOffset, this);
+
             long offset = fetchOffsets.get(partition);
             if (offset == oldOffset)
             {

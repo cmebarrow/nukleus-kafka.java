@@ -507,8 +507,10 @@ public final class NetworkConnectionPool
             metadata.doDetach(attachId);
             if (!metadata.hasConsumers())
             {
-                topicMetadataByName.remove(topicName);
-                topicsByName.remove(topicName);
+                metadata = topicMetadataByName.remove(topicName);
+                NetworkTopic topic = topicsByName.remove(topicName);
+                System.out.format("NCP.doDetach: removed metadata %s, topic %s !!!\n",
+                        metadata, topic);
             }
         }
     }
@@ -2142,7 +2144,9 @@ public final class NetworkConnectionPool
         @Override
         public String toString()
         {
-            return format("topicName=%s, partitions=%s, needsHistoricalByPartition=%s, isLiveByPartition=%s",
+            return format("%s@%s(topicName=%s, partitions=%s, needsHistoricalByPartition=%s, isLiveByPartition=%s)",
+                    getClass().getSimpleName(),
+                    Integer.toHexString(System.identityHashCode(this)),
                     topicName, partitions, needsHistoricalByPartition, isLiveByPartition);
         }
 
@@ -2226,7 +2230,7 @@ public final class NetworkConnectionPool
             IntSupplier supplyWindow)
         {
             System.out.format(
-                    "NCP.doAttach: fetchKey = %s, headers.sizeof = %d, dispatcher = %s, topic=%s\n",
+                    "NT.doAttach: fetchKey = %s, headers.sizeof = %d, dispatcher = %s, topic=%s\n",
                     fetchKey, headers.sizeof() - 4, dispatcher, this);
             windowSuppliers.add(supplyWindow);
             headersIterator.wrap(headers);
@@ -2307,7 +2311,7 @@ public final class NetworkConnectionPool
             IntSupplier supplyWindow)
         {
             System.out.format(
-                    "NCP.doDetach: fetchKey = %s, headers.sizeof = %d, dispatcher = %s, topic = %s\n",
+                    "NT.doDetach: fetchKey = %s, headers.sizeof = %d, dispatcher = %s, topic = %s\n",
                     fetchKey, headers.sizeof() - 4, dispatcher, this);
             windowSuppliers.remove(supplyWindow);
             int fetchKeyPartition = (int) (fetchKey == null ? -1 : fetchOffsets.keySet().iterator().next());
@@ -2395,7 +2399,7 @@ public final class NetworkConnectionPool
             MessageDispatcher dispatcher)
         {
             System.out.format(
-                    "NCP.handleProgress: partition = %d, firstOffset = %d, nextOffset = %d, dispatcher = %s, " +
+                    "NT.handleProgress: partition = %d, firstOffset = %d, nextOffset = %d, dispatcher = %s, " +
                     "topic = %s\n",
                     partitionId, firstOffset, nextOffset, dispatcher, this);
             candidate.id = partitionId;
